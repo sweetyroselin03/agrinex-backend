@@ -402,3 +402,31 @@ def reset_password(request: schemas.ResetPasswordRequest, db: Session = Depends(
     db.commit()
     
     return {"message": "Password reset successfully"}
+
+@router.post("/refresh")
+def refresh_token(request: schemas.RefreshTokenRequest, db: Session = Depends(get_db)):
+    """Exchange a valid refresh token for a new access + refresh token pair."""
+    payload = auth_utils.verify_token(request.refresh_token, expected_type="refresh")
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token"
+        )
+    
+    email = payload.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    new_access_token = auth_utils.create_access_token(data={"sub": user.email})
+    new_refresh_token = auth_utils.create_refresh_token(data={"sub": user.email})
+    
+    logger.info(f"[Token Refresh] Tokens refreshed for {user.email}")
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer"
+    }

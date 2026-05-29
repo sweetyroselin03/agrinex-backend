@@ -18,46 +18,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 # Create tables
 models.Base.metadata.create_all(bind=engine)
 
-def run_db_migrations():
-    import sqlite3
-    import os
-    db_path = "./agrinex.db"
-    if not os.path.exists(db_path):
-        return
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(crop_scans)")
-        columns = [row[1] for row in cursor.fetchall()]
-        
-        # Check and add columns
-        new_cols = {
-            "severity_level": "TEXT",
-            "health_score": "INTEGER",
-            "yield_impact": "TEXT",
-            "pro_tips": "TEXT",
-            "prevention_tips": "TEXT",
-            "is_valid_crop": "BOOLEAN DEFAULT 1",
-            "detected_object": "TEXT",
-            "rejection_reason": "TEXT"
-        }
-        for col, col_type in new_cols.items():
-            if col not in columns:
-                cursor.execute(f"ALTER TABLE crop_scans ADD COLUMN {col} {col_type}")
-                print(f"Migration: Added column {col} to crop_scans table")
-                
-        cursor.execute("PRAGMA table_info(posts)")
-        post_columns = [row[1] for row in cursor.fetchall()]
-        if "images" not in post_columns:
-            cursor.execute("ALTER TABLE posts ADD COLUMN images TEXT")
-            print("Migration: Added column images to posts table")
-            
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Migration warning: {e}")
-
-run_db_migrations()
+logger_startup = logging.getLogger("uvicorn.error")
+logger_startup.info("[Startup] Database tables synchronized via SQLAlchemy ORM.")
 
 ENV = os.getenv("ENV", "production")
 show_docs = os.getenv("SHOW_DOCS", "false").lower() in ("true", "1", "yes") or ENV == "development"
@@ -85,15 +47,8 @@ app.add_middleware(
 
 app.include_router(auth_router.router)
 
-@app.on_event("startup")
-def startup_validation():
-    try:
-        from .auth_utils import validate_smtp_credentials
-        validate_smtp_credentials()
-    except Exception as e:
-        print(f"[ERROR] Error during startup SMTP validation: {e}")
-
 logger = logging.getLogger("uvicorn.error")
+logger.info("[Startup] Application ready. Brevo Transactional Email API will be used on-demand during OTP requests.")
 
 @app.middleware("http")
 async def log_requests(request, call_next):

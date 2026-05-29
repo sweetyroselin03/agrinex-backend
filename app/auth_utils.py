@@ -1,8 +1,6 @@
 import os
-import smtplib
 import logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import httpx
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
@@ -16,13 +14,12 @@ logger = logging.getLogger("uvicorn.error")
 SECRET_KEY = os.getenv("SECRET_KEY", "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 43200))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", 7))
 
-# SMTP Settings
-SMTP_HOST = os.getenv("EXPO_PUBLIC_SMTP_HOST") or os.getenv("SMTP_HOST") or "smtp.gmail.com"
-SMTP_PORT = int(os.getenv("EXPO_PUBLIC_SMTP_PORT") or os.getenv("SMTP_PORT") or 587)
-SMTP_USER = os.getenv("SMTP_USER") or os.getenv("EMAIL_USER")
-SMTP_PASS = os.getenv("SMTP_PASS") or os.getenv("EMAIL_PASS")
-SMTP_FROM = os.getenv("EXPO_PUBLIC_SMTP_FROM") or os.getenv("SMTP_FROM") or SMTP_USER
+# Brevo API Settings
+BREVO_API_KEY = (os.getenv("BREVO_API_KEY") or "").strip()
+BREVO_FROM = (os.getenv("BREVO_FROM") or os.getenv("SMTP_FROM") or "agrinex2026@gmail.com").strip()
+BREVO_TIMEOUT = 10
 
 # Twilio Settings
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -45,26 +42,50 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
         expire = datetime.utcnow() + expires_delta
     else:
         expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "type": "access"})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def send_otp_email(email: str, otp: str):
-    """Returns (success: bool, is_mock: bool)"""
-    if not SMTP_USER or not SMTP_PASS:
-        logger.warning(f"[SMTP] SMTP not configured. DEV OTP for {email}: {otp}")
-        return (True, True)
-    
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"{otp} is your AgriNex verification code"
-        msg["From"] = f"AgriNex AI <{SMTP_FROM}>"
-        msg["To"] = email
+def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
+def verify_token(token: str, expected_type: str = "access") -> Optional[dict]:
+    """Verify and decode a JWT token. Returns payload if valid, None otherwise."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        token_type = payload.get("type", "access")
+        if token_type != expected_type:
+            logger.warning(f"[JWT] Token type mismatch: expected {expected_type}, got {token_type}")
+            return None
+        return payload
+    except JWTError as e:
+        logger.warning(f"[JWT] Token verification failed: {e}")
+        return None
+
+def send_otp_email(email: str, otp: str):
+    """
+    Send OTP verification email via Brevo Transactional Email REST API.
+    Returns (success: bool, is_mock: bool).
+    """
+    logger.info(f"[Brevo API] send_otp_email called for {email}")
+
+    if not BREVO_API_KEY:
+        logger.warning(f"[Brevo API] API Key not configured. DEV OTP for {email}: {otp}")
+        return (True, True)
+
+    logger.info(f"[Brevo API] Config: sender={BREVO_FROM}, timeout={BREVO_TIMEOUT}s")
+
+    try:
         plain_text = f"Your AgriNex verification code is: {otp}. Valid for 5 minutes."
 
-        html = f"""
-        <!DOCTYPE html>
+        html = f"""<!DOCTYPE html>
         <html>
         <head>
             <meta charset="UTF-8">
@@ -110,35 +131,51 @@ def send_otp_email(email: str, otp: str):
         </body>
         </html>
         """
-        msg.attach(MIMEText(plain_text, "plain"))
-        msg.attach(MIMEText(html, "html"))
 
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
-        server.quit()
-        return (True, False)
-    except Exception as e:
-        logger.error(f"[SMTP] Failed to send email via SMTP to {email}: {e}")
+        headers = {
+            "accept": "application/json",
+            "api-key": BREVO_API_KEY,
+            "content-type": "application/json"
+        }
+        
+        payload = {
+            "sender": {
+                "name": "AgriNex AI",
+                "email": BREVO_FROM
+            },
+            "to": [
+                {
+                    "email": email
+                }
+            ],
+            "subject": f"{otp} is your AgriNex verification code",
+            "htmlContent": html,
+            "textContent": plain_text
+        }
+
+        logger.info(f"[Brevo API] Sending POST request to https://api.brevo.com/v3/smtp/email (timeout={BREVO_TIMEOUT}s)...")
+        with httpx.Client(timeout=BREVO_TIMEOUT) as client:
+            response = client.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()
+            logger.info(f"[Brevo API] Email sent successfully to {email}. Response: {response.text}")
+            return (True, False)
+
+    except httpx.TimeoutException as e:
+        logger.error(f"[Brevo API] Timeout error sending email to {email} after {BREVO_TIMEOUT}s: {e}")
         return (False, False)
-
-def validate_smtp_credentials():
-    """Validates SMTP configuration and credentials on startup by logging in."""
-    if not SMTP_USER or not SMTP_PASS:
-        logger.warning("[SMTP] Configuration missing or incomplete. Email sending will run in MOCK mode.")
-        return False
-    try:
-        logger.info(f"[SMTP] Testing SMTP connection to {SMTP_HOST}:{SMTP_PORT} using {SMTP_USER}...")
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=5)
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.quit()
-        logger.info("[SMTP] Connection and credentials verified successfully!")
-        return True
+    except httpx.HTTPStatusError as e:
+        logger.error(f"[Brevo API] HTTP status error sending email to {email}: {e.response.status_code} - {e.response.text}")
+        return (False, False)
+    except httpx.RequestError as e:
+        logger.error(f"[Brevo API] Network/Request error sending email to {email}: {e}")
+        return (False, False)
     except Exception as e:
-        logger.error(f"[SMTP] Connection verification failed: {e}")
-        return False
+        logger.error(f"[Brevo API] Unexpected error sending email to {email}: {type(e).__name__}: {e}")
+        return (False, False)
 
 def send_otp_sms(phone: str, otp: str = None):
     """
@@ -179,6 +216,6 @@ def verify_twilio_otp(phone: str, code: str):
             .create(to=phone, code=code)
         return verification_check.status == "approved"
     except Exception as e:
-        print(f"Failed to verify SMS via Twilio: {e}")
+        logger.error(f"[SMS] Failed to verify SMS via Twilio: {e}")
         return True
 

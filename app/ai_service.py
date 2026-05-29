@@ -77,23 +77,27 @@ class AIService:
                 "Be STRICT. If it is NOT a crop/plant, reject it. If it is blurry/dark, reject it. ONLY output valid JSON, no other text."
             )
 
-            response = self.client.chat.completions.create(
-                model="llama-3.2-11b-vision-preview",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": validation_prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": image_url},
-                            },
-                        ],
-                    }
-                ],
-                temperature=0.1,
-                max_tokens=256,
-                response_format={"type": "json_object"}
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.chat.completions.create,
+                    model="llama-3.2-11b-vision-preview",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": validation_prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": image_url},
+                                },
+                            ],
+                        }
+                    ],
+                    temperature=0.1,
+                    max_tokens=256,
+                    response_format={"type": "json_object"}
+                ),
+                timeout=30.0  # 30 second timeout for vision calls
             )
 
             result = json.loads(response.choices[0].message.content)
@@ -105,6 +109,9 @@ class AIService:
                 "quality_issue": result.get("quality_issue", None),
             }
 
+        except asyncio.TimeoutError:
+            logger.error(f"Crop validation timeout after 30s for image")
+            return self._fallback_crop_validation(image_url)
         except Exception as e:
             logger.error(f"Crop validation error: {e}")
             return self._fallback_crop_validation(image_url)
@@ -153,25 +160,29 @@ class AIService:
                 "ONLY output valid JSON, no other text."
             )
 
-            response = self.client.chat.completions.create(
-                model="llama-3.2-11b-vision-preview",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": image_url,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.chat.completions.create,
+                    model="llama-3.2-11b-vision-preview",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_url,
+                                    },
                                 },
-                            },
-                        ],
-                    }
-                ],
-                temperature=0.3,
-                max_tokens=1024,
-                response_format={"type": "json_object"}
+                            ],
+                        }
+                    ],
+                    temperature=0.3,
+                    max_tokens=1024,
+                    response_format={"type": "json_object"}
+                ),
+                timeout=30.0  # 30 second timeout for disease detection
             )
             
             result = json.loads(response.choices[0].message.content)
@@ -206,6 +217,9 @@ class AIService:
             
             return result
 
+        except asyncio.TimeoutError:
+            logger.error(f"Disease detection timeout after 30s for image")
+            return self._fallback_disease_detection(image_url)
         except Exception as e:
             logger.error(f"Groq Vision Error: {e}")
             return self._fallback_disease_detection(image_url)
@@ -412,12 +426,16 @@ class AIService:
 
             messages.append({"role": "user", "content": message})
 
-            response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.6,
-                max_tokens=1024,
-                top_p=0.9,
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.chat.completions.create,
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    temperature=0.6,
+                    max_tokens=1024,
+                    top_p=0.9,
+                ),
+                timeout=20.0  # 20 second timeout for chat responses
             )
             
             result = response.choices[0].message.content
@@ -427,6 +445,9 @@ class AIService:
             
             return result
 
+        except asyncio.TimeoutError:
+            logger.error(f"Chat AI timeout after 20s")
+            return self._fallback_chat_response(message)
         except Exception as e:
             logger.error(f"Groq Chat Error: {e}")
             return self._fallback_chat_response(message)

@@ -97,6 +97,9 @@ class ResetPasswordRequest(BaseModel):
     otp: str
     new_password: str
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
 
 # ─── Post ─────────────────────────────────────────────────────────────────────
 class PostCreate(BaseModel):
