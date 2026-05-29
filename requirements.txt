@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+emails
+twilio
+bcrypt==3.2.0
+httpx
+groq
+gunicorn

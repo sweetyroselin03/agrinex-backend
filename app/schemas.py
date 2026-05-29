@@ -1,0 +1,293 @@
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime
+
+
+# ─── User ────────────────────────────────────────────────────────────────────
+class UserBase(BaseModel):
+    email: str
+    phone: Optional[str] = None
+
+class UserCreate(UserBase):
+    pass
+
+class UserUpdate(BaseModel):
+    full_name: Optional[str] = None
+    username: Optional[str] = None
+    village: Optional[str] = None
+    district: Optional[str] = None
+    state: Optional[str] = None
+    farm_size: Optional[str] = None
+    experience: Optional[str] = None
+    crop_specialization: Optional[str] = None
+    crop_types: Optional[str] = None
+    profile_picture: Optional[str] = None
+    bio: Optional[str] = None
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+    phone: Optional[str] = None
+    full_name: Optional[str] = None
+    username: Optional[str] = None
+    village: Optional[str] = None
+    district: Optional[str] = None
+    state: Optional[str] = None
+    farm_size: Optional[str] = None
+    experience: Optional[str] = None
+    crop_specialization: Optional[str] = None
+    crop_types: Optional[str] = None
+    profile_picture: Optional[str] = None
+    bio: Optional[str] = None
+    is_verified: Optional[bool] = False
+    followers_count: Optional[int] = 0
+    following_count: Optional[int] = 0
+    posts_count: Optional[int] = 0
+
+    class Config:
+        from_attributes = True
+
+# Keep legacy alias
+User = UserOut
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+class RegisterRequest(BaseModel):
+    full_name: str
+    email: str
+    phone: str
+
+class PasswordSetRequest(BaseModel):
+    email: str
+    password: str
+
+class OTPRequest(BaseModel):
+    email: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class OTPVerify(BaseModel):
+    email: str
+    otp: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserOut
+    is_new: Optional[bool] = False
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class GoogleLoginRequest(BaseModel):
+    id_token: str
+    profile: dict
+
+
+class CheckAccountRequest(BaseModel):
+    identifier: str
+
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    otp: str
+    new_password: str
+
+
+# ─── Post ─────────────────────────────────────────────────────────────────────
+class PostCreate(BaseModel):
+    content: str
+    image_url: Optional[str] = None
+    images: Optional[List[str]] = None
+    hashtags: Optional[str] = None
+    location: Optional[str] = None
+    crop_category: Optional[str] = None
+
+class PostUpdate(BaseModel):
+    content: Optional[str] = None
+    image_url: Optional[str] = None
+    images: Optional[List[str]] = None
+    hashtags: Optional[str] = None
+    location: Optional[str] = None
+    crop_category: Optional[str] = None
+
+class PostOut(BaseModel):
+    id: int
+    user_id: int
+    content: str
+    image_url: Optional[str] = None
+    images: Optional[List[str]] = []
+    hashtags: Optional[str] = None
+    location: Optional[str] = None
+    crop_category: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    likes_count: Optional[int] = 0
+    comments_count: Optional[int] = 0
+    is_liked: Optional[bool] = False
+    is_saved: Optional[bool] = False
+    author_name: Optional[str] = None
+    author_avatar: Optional[str] = None
+    author_verified: Optional[bool] = False
+
+    class Config:
+        from_attributes = True
+
+# Keep legacy alias
+Post = PostOut
+
+
+# ─── Like ─────────────────────────────────────────────────────────────────────
+class LikeOut(BaseModel):
+    liked: bool
+    likes_count: int
+
+
+# ─── Comment ──────────────────────────────────────────────────────────────────
+class CommentCreate(BaseModel):
+    content: str
+    parent_id: Optional[int] = None
+
+class CommentOut(BaseModel):
+    id: int
+    user_id: int
+    post_id: int
+    content: str
+    parent_id: Optional[int] = None
+    created_at: datetime
+    author_name: Optional[str] = None
+    author_avatar: Optional[str] = None
+    replies: Optional[List['CommentOut']] = []
+
+    class Config:
+        from_attributes = True
+
+CommentOut.model_rebuild()
+
+
+# ─── Follow ───────────────────────────────────────────────────────────────────
+class FollowOut(BaseModel):
+    following: bool
+    followers_count: int
+
+
+# ─── Notification ─────────────────────────────────────────────────────────────
+class NotificationOut(BaseModel):
+    id: int
+    user_id: int
+    type: str
+    message: str
+    is_read: bool
+    created_at: datetime
+    post_id: Optional[int] = None
+    actor_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── SavedPost ────────────────────────────────────────────────────────────────
+class SaveOut(BaseModel):
+    saved: bool
+
+
+# ─── Chat ─────────────────────────────────────────────────────────────────────
+class ChatMessageCreate(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+    language: Optional[str] = None
+
+class ChatMessage(BaseModel):
+    id: int
+    user_id: int
+    conversation_id: Optional[str] = None
+    message: str
+    is_ai: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ConversationSummary(BaseModel):
+    id: str
+    title: str
+    preview: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    message_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Crop Scan ────────────────────────────────────────────────────────────────
+class CropScanCreate(BaseModel):
+    image_url: str
+
+class CropScanOut(BaseModel):
+    id: int
+    user_id: int
+    image_url: str
+    disease_name: str
+    confidence: float
+    is_valid_crop: Optional[bool] = True
+    severity_level: Optional[str] = "Warning"
+    symptoms: Optional[str] = None
+    causes: Optional[str] = None
+    prevention: Optional[str] = None
+    pesticide_recommendations: Optional[str] = None
+    organic_treatment: Optional[str] = None
+    irrigation_recommendations: Optional[str] = None
+    fertilizer_recommendations: Optional[str] = None
+    recovery_steps: Optional[str] = None
+    estimated_recovery_time: Optional[str] = None
+    weather_risk: Optional[str] = None
+    prevention_tips: Optional[str] = None
+    detected_object: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    health_score: Optional[int] = None
+    yield_impact: Optional[str] = None
+    pro_tips: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Weather ──────────────────────────────────────────────────────────────────
+class WeatherAlert(BaseModel):
+    type: str
+    severity: str
+    message: str
+    icon: str
+
+class WeatherForecastDay(BaseModel):
+    day: str
+    temp: int
+    condition: str
+    icon: str
+
+class WeatherResponse(BaseModel):
+    temp: float
+    feels_like: Optional[float] = None
+    condition: str
+    humidity: int
+    wind: float
+    uv_index: Optional[float] = None
+    rain_probability: Optional[int] = None
+    pressure: Optional[float] = None
+    visibility: Optional[float] = None
+    location: str
+    sunrise: Optional[str] = None
+    sunset: Optional[str] = None
+    daily_high: Optional[float] = None
+    daily_low: Optional[float] = None
+    soil_moisture: Optional[str] = None
+    farming_suitability: Optional[str] = None
+    alerts: Optional[List[WeatherAlert]] = []
+    forecast: Optional[List[WeatherForecastDay]] = []
