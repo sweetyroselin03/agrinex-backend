@@ -2,10 +2,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import random
+import os
+import logging
 from . import models, schemas, auth_utils
 from .database import get_db
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+logger = logging.getLogger("uvicorn.error")
 
 @router.post("/send-otp")
 def send_otp(request: schemas.OTPRequest, db: Session = Depends(get_db)):
@@ -24,14 +27,35 @@ def send_otp(request: schemas.OTPRequest, db: Session = Depends(get_db)):
         if " " in request.email or identifier.endswith("gmail.con") or identifier.endswith("gmail,com") or "@" not in identifier:
             raise HTTPException(status_code=400, detail="Invalid email format")
     
+    # 1. Automatic cleanup of expired OTP records for this user to prevent database pollution
+    try:
+        expired_count = db.query(models.OTPCode).filter(
+            (models.OTPCode.email_or_phone == identifier) & (models.OTPCode.expires_at < datetime.utcnow())
+        ).delete()
+        if expired_count > 0:
+            db.commit()
+            logger.info(f"[OTP Cleanup] Removed {expired_count} expired OTP records for {identifier}")
+    except Exception as cleanup_err:
+        logger.error(f"[OTP Cleanup Error]: {cleanup_err}")
+        db.rollback()
+
     db_otp = db.query(models.OTPCode).filter(models.OTPCode.email_or_phone == identifier).first()
     
-    if db_otp and datetime.utcnow() < db_otp.last_sent_at + timedelta(seconds=30):
-        raise HTTPException(status_code=429, detail="Please wait 30 seconds before requesting a new OTP")
+    # 2. Check 30s cooldown only if db_otp exists and has last_sent_at set.
+    if db_otp and db_otp.last_sent_at:
+        time_elapsed = (datetime.utcnow() - db_otp.last_sent_at).total_seconds()
+        if time_elapsed < 30:
+            retry_after = int(30 - time_elapsed)
+            logger.warning(f"[OTP Cooldown Blocked] {identifier} requested OTP again in {time_elapsed:.1f}s. Cooldown active for {retry_after}s.")
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Please wait {retry_after} seconds before requesting a new OTP."
+            )
 
     otp = str(random.randint(100000, 999999))
     expiry = datetime.utcnow() + timedelta(minutes=5)
     
+    # Prepare update/insert but do not commit yet.
     if db_otp:
         db_otp.otp_code = otp
         db_otp.expires_at = expiry
@@ -46,18 +70,48 @@ def send_otp(request: schemas.OTPRequest, db: Session = Depends(get_db)):
             last_sent_at=datetime.utcnow()
         )
         db.add(db_otp)
-    db.commit()
     
+    is_dev = os.getenv("ENV", "production") == "development"
+    logger.info(f"[OTP Request] Generated OTP for {identifier} (Is Phone: {is_phone}, Env: {os.getenv('ENV', 'production')})")
+
     if is_phone:
         sent = auth_utils.send_otp_sms(identifier, otp)
         if not sent:
-            raise HTTPException(status_code=500, detail="OTP provider failed")
+            logger.error(f"[OTP SMS Error] Failed to send SMS via Twilio to {identifier}")
+            db.rollback()
+            raise HTTPException(status_code=500, detail="Failed to send SMS verification code.")
+        db.commit()
+        logger.info(f"[OTP SMS Success] OTP code sent successfully to {identifier}")
         return {"message": "Verification code sent successfully", "identifier": identifier}
     else:
-        result = auth_utils.send_otp_email(identifier, otp)
-        success, is_mock = result if isinstance(result, tuple) else (result, False)
+        # Email OTP sending
+        try:
+            success, is_mock = auth_utils.send_otp_email(identifier, otp)
+        except Exception as email_err:
+            logger.error(f"[OTP Email Error] Exception occurred while sending email to {identifier}: {email_err}")
+            success, is_mock = False, False
+
         if not success:
-            raise HTTPException(status_code=500, detail="OTP provider failed")
+            if is_dev:
+                # In development mode, fallback to dev_otp
+                logger.info(f"[OTP Email Dev Fallback] Email sending failed, but running in development mode. Returning dev_otp: {otp}")
+                db.commit()
+                return {
+                    "message": "Verification code generated (dev fallback)",
+                    "identifier": identifier,
+                    "dev_otp": otp
+                }
+            else:
+                # In production, do not commit. Rollback so cooldown isn't registered for failed attempts.
+                logger.error(f"[OTP Email Error] Failed to deliver email to {identifier} in production.")
+                db.rollback()
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to send verification email. Please check your email address or try again later."
+                )
+
+        db.commit()
+        logger.info(f"[OTP Email Success] Email sent successfully to {identifier} (Is Mock: {is_mock})")
         response = {"message": "Verification code sent successfully", "identifier": identifier}
         if is_mock:
             response["dev_otp"] = otp
@@ -67,6 +121,7 @@ def send_otp(request: schemas.OTPRequest, db: Session = Depends(get_db)):
 def verify_otp(request: schemas.OTPVerify, db: Session = Depends(get_db)):
     identifier = request.email.strip().replace(" ", "")
     is_phone = identifier.replace("+", "").isdigit()
+    logger.info(f"[OTP Verification Request] Verifying OTP for {identifier} (Is Phone: {is_phone})")
 
     if is_phone:
         if not identifier.startswith("+") and len(identifier) == 10:
@@ -75,21 +130,30 @@ def verify_otp(request: schemas.OTPVerify, db: Session = Depends(get_db)):
         verified = auth_utils.verify_twilio_otp(identifier, request.otp)
         if not verified:
             db_otp = db.query(models.OTPCode).filter(models.OTPCode.email_or_phone == identifier).first()
-            if not db_otp or db_otp.otp_code != request.otp or datetime.utcnow() > db_otp.expires_at:
+            if not db_otp:
+                logger.error(f"[OTP Verification Failed] No custom OTP record found for {identifier}")
+                raise HTTPException(status_code=400, detail="No OTP requested for this phone number")
+            
+            if db_otp.otp_code != request.otp or datetime.utcnow() > db_otp.expires_at:
+                logger.error(f"[OTP Verification Failed] Custom OTP code invalid or expired for {identifier}")
                 raise HTTPException(status_code=400, detail="Invalid or expired OTP code")
             db_otp.verified = True
             db.commit()
+            logger.info(f"[OTP Verification Success] Phone custom OTP verified successfully for {identifier}")
         else:
             db_otp = db.query(models.OTPCode).filter(models.OTPCode.email_or_phone == identifier).first()
             if db_otp:
                 db_otp.verified = True
                 db.commit()
+            logger.info(f"[OTP Verification Success] Phone Twilio OTP verified successfully for {identifier}")
     else:
         db_otp = db.query(models.OTPCode).filter(models.OTPCode.email_or_phone == identifier).first()
         if not db_otp:
-            raise HTTPException(status_code=400, detail="No OTP requested for this email")
+            logger.error(f"[OTP Verification Failed] No OTP record found in database for {identifier}")
+            raise HTTPException(status_code=400, detail="No OTP requested for this email address.")
         
         if db_otp.attempts >= 5:
+            logger.error(f"[OTP Verification Failed] {identifier} exceeded max verification attempts.")
             db.delete(db_otp)
             db.commit()
             raise HTTPException(status_code=400, detail="Too many failed attempts. Please request a new OTP.")
@@ -97,27 +161,33 @@ def verify_otp(request: schemas.OTPVerify, db: Session = Depends(get_db)):
         if db_otp.otp_code != request.otp:
             db_otp.attempts += 1
             db.commit()
-            raise HTTPException(status_code=400, detail=f"Invalid OTP code. {5 - db_otp.attempts} attempts remaining.")
+            remaining = 5 - db_otp.attempts
+            logger.error(f"[OTP Verification Failed] Invalid OTP entered for {identifier}. Remaining attempts: {remaining}")
+            raise HTTPException(status_code=400, detail=f"Invalid OTP code. You have {remaining} attempts remaining.")
         
         if datetime.utcnow() > db_otp.expires_at:
+            logger.error(f"[OTP Verification Failed] OTP code expired for {identifier} (Expired at {db_otp.expires_at})")
             db.delete(db_otp)
             db.commit()
-            raise HTTPException(status_code=400, detail="OTP code expired")
+            raise HTTPException(status_code=400, detail="OTP code has expired. Please request a new one.")
         
         db_otp.verified = True
         db.commit()
+        logger.info(f"[OTP Verification Success] Email OTP verified successfully for {identifier}")
     
+    # Check if user exists
     user = db.query(models.User).filter(
         (models.User.email == identifier) | (models.User.phone == identifier) | (models.User.email == f"{identifier}@agrinex.local")
     ).first()
         
     if user:
         access_token = auth_utils.create_access_token(data={"sub": user.email})
+        # Cleanup verified OTP code
         db_otp = db.query(models.OTPCode).filter(models.OTPCode.email_or_phone == identifier).first()
         if db_otp:
             db.delete(db_otp)
-        db.commit()
-        
+            db.commit()
+        logger.info(f"[OTP Verification Complete] User {identifier} logged in via OTP.")
         return {
             "message": "OTP verified successfully",
             "access_token": access_token,
@@ -125,6 +195,7 @@ def verify_otp(request: schemas.OTPVerify, db: Session = Depends(get_db)):
             "user": user
         }
     
+    logger.info(f"[OTP Verification Complete] {identifier} verified, ready for registration/signup.")
     return {"message": "OTP verified successfully", "identifier": identifier}
 
 @router.post("/check-account")

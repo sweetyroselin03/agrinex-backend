@@ -85,6 +85,14 @@ app.add_middleware(
 
 app.include_router(auth_router.router)
 
+@app.on_event("startup")
+def startup_validation():
+    try:
+        from .auth_utils import validate_smtp_credentials
+        validate_smtp_credentials()
+    except Exception as e:
+        print(f"[ERROR] Error during startup SMTP validation: {e}")
+
 logger = logging.getLogger("uvicorn.error")
 
 @app.middleware("http")

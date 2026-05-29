@@ -1,5 +1,6 @@
 import os
 import smtplib
+import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
@@ -9,6 +10,7 @@ from passlib.context import CryptContext
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger("uvicorn.error")
 
 # JWT Settings
 SECRET_KEY = os.getenv("SECRET_KEY", "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7")
@@ -18,8 +20,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 43200
 # SMTP Settings
 SMTP_HOST = os.getenv("EXPO_PUBLIC_SMTP_HOST") or os.getenv("SMTP_HOST") or "smtp.gmail.com"
 SMTP_PORT = int(os.getenv("EXPO_PUBLIC_SMTP_PORT") or os.getenv("SMTP_PORT") or 587)
-SMTP_USER = os.getenv("EXPO_PUBLIC_SMTP_EMAIL") or os.getenv("SMTP_USER") or os.getenv("EMAIL_USER")
-SMTP_PASS = os.getenv("EXPO_PUBLIC_SMTP_PASSWORD") or os.getenv("SMTP_PASS") or os.getenv("EMAIL_PASS")
+SMTP_USER = os.getenv("SMTP_USER") or os.getenv("EMAIL_USER")
+SMTP_PASS = os.getenv("SMTP_PASS") or os.getenv("EMAIL_PASS")
 SMTP_FROM = os.getenv("EXPO_PUBLIC_SMTP_FROM") or os.getenv("SMTP_FROM") or SMTP_USER
 
 # Twilio Settings
@@ -50,7 +52,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 def send_otp_email(email: str, otp: str):
     """Returns (success: bool, is_mock: bool)"""
     if not SMTP_USER or not SMTP_PASS:
-        print(f"⚠️  SMTP not configured. DEV OTP for {email}: {otp}")
+        logger.warning(f"[SMTP] SMTP not configured. DEV OTP for {email}: {otp}")
         return (True, True)
     
     try:
@@ -118,9 +120,25 @@ def send_otp_email(email: str, otp: str):
         server.quit()
         return (True, False)
     except Exception as e:
-        print(f"Failed to send email: {e}")
-        print(f"⚠️  SMTP failed. DEV OTP for {email}: {otp} (Fallback mode)")
-        return (True, True)
+        logger.error(f"[SMTP] Failed to send email via SMTP to {email}: {e}")
+        return (False, False)
+
+def validate_smtp_credentials():
+    """Validates SMTP configuration and credentials on startup by logging in."""
+    if not SMTP_USER or not SMTP_PASS:
+        logger.warning("[SMTP] Configuration missing or incomplete. Email sending will run in MOCK mode.")
+        return False
+    try:
+        logger.info(f"[SMTP] Testing SMTP connection to {SMTP_HOST}:{SMTP_PORT} using {SMTP_USER}...")
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=5)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.quit()
+        logger.info("[SMTP] Connection and credentials verified successfully!")
+        return True
+    except Exception as e:
+        logger.error(f"[SMTP] Connection verification failed: {e}")
+        return False
 
 def send_otp_sms(phone: str, otp: str = None):
     """
@@ -130,7 +148,7 @@ def send_otp_sms(phone: str, otp: str = None):
     The user asked for Twilio Verify API specifically.
     """
     if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_VERIFY_SERVICE_SID:
-        print(f"Twilio credentials not configured. MOCK OTP SMS for {phone}: {otp}")
+        logger.warning(f"[SMS] Twilio credentials not configured. MOCK OTP SMS for {phone}: {otp}")
         return True
     
     from twilio.rest import Client
@@ -143,8 +161,8 @@ def send_otp_sms(phone: str, otp: str = None):
             .create(to=phone, channel='sms')
         return verification.status == "pending"
     except Exception as e:
-        print(f"Failed to send SMS via Twilio: {e}")
-        print(f"MOCK OTP SMS for {phone}: {otp} (Fallback mode)")
+        logger.error(f"[SMS] Failed to send SMS via Twilio: {e}")
+        logger.warning(f"[SMS] MOCK OTP SMS for {phone}: {otp} (Fallback mode)")
         return True
 
 def verify_twilio_otp(phone: str, code: str):
