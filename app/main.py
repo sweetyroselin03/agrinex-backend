@@ -150,16 +150,16 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
 def follow_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="You cannot follow yourself")
-    
+
     target_user = db.query(models.User).filter(models.User.id == user_id).first()
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
-        
+
     follow = db.query(models.Follow).filter(
         models.Follow.follower_id == current_user.id,
         models.Follow.following_id == user_id
     ).first()
-    
+
     if follow:
         db.delete(follow)
         db.commit()
@@ -169,28 +169,67 @@ def follow_user(user_id: int, current_user: models.User = Depends(get_current_us
         db.add(new_follow)
         db.commit()
         following = True
-        
+        # Notify the followed user (NOT the follower)
+        actor_name = current_user.full_name or f"Farmer {current_user.id}"
+        create_notification(db, user_id, current_user.id, "FOLLOW",
+            f"{actor_name} started following you")
+
     followers_count = db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
-    return schemas.FollowOut(following=following, followers_count=followers_count)
+    following_count = db.query(models.Follow).filter(models.Follow.follower_id == current_user.id).count()
+    return schemas.FollowOut(following=following, followers_count=followers_count, following_count=following_count)
+
+# ─── Notification Helper ───
+def create_notification(db, user_id: int, actor_id: int, notif_type: str, message: str, post_id: int = None):
+    """Create a notification. Only sends to the recipient (user_id), never to the actor."""
+    if user_id == actor_id:
+        return  # Never notify yourself
+    try:
+        notif = models.Notification(
+            user_id=user_id,
+            actor_id=actor_id,
+            type=notif_type,
+            post_id=post_id,
+            message=message,
+            is_read=False,
+        )
+        db.add(notif)
+        db.commit()
+    except Exception as e:
+        logger.error(f"[Notification] Failed to create notification: {e}")
+        db.rollback()
 
 # ─── Community Posts ───
 @app.post("/posts", response_model=schemas.PostOut)
 def create_post(post: schemas.PostCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    post_dict = post.dict()
-    images_list = post_dict.pop("images", None)
-    
-    # Serialize images list to JSON string
-    images_json = json.dumps(images_list) if images_list is not None else None
-    
-    # Set image_url to first image for backward compatibility
-    if not post_dict.get("image_url") and images_list:
-        post_dict["image_url"] = images_list[0]
-        
-    db_post = models.Post(**post_dict, images=images_json, user_id=current_user.id)
-    db.add(db_post)
-    db.commit()
-    db.refresh(db_post)
-    return prepare_post_out(db_post, current_user.id, db)
+    try:
+        logger.info(f"[CreatePost] User {current_user.id} creating post")
+        post_dict = post.dict()
+        images_list = post_dict.pop("images", None)
+
+        # Validate content
+        if not post_dict.get("content", "").strip():
+            raise HTTPException(status_code=400, detail="Post content cannot be empty")
+
+        # Serialize images list to JSON string
+        images_json = json.dumps(images_list) if images_list is not None else None
+
+        # Set image_url to first image for backward compatibility
+        if not post_dict.get("image_url") and images_list:
+            post_dict["image_url"] = images_list[0]
+
+        db_post = models.Post(**post_dict, images=images_json, user_id=current_user.id)
+        db.add(db_post)
+        db.commit()
+        db.refresh(db_post)
+        logger.info(f"[CreatePost] Post {db_post.id} created successfully for user {current_user.id}")
+        # Pass current_user directly to avoid DetachedInstanceError on lazy-loaded relationship
+        return prepare_post_out(db_post, current_user.id, db, author=current_user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[CreatePost] Error creating post for user {current_user.id}: {e}", exc_info=True)
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to create post: {str(e)}")
 
 @app.get("/posts", response_model=List[schemas.PostOut])
 def get_feed(skip: int = 0, limit: int = 20, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -226,21 +265,35 @@ def delete_post(post_id: int, current_user: models.User = Depends(get_current_us
     db.commit()
     return {"message": "Post deleted successfully"}
 
-def prepare_post_out(post, current_user_id, db):
+def prepare_post_out(post, current_user_id, db, author=None):
     likes_count = db.query(models.Like).filter(models.Like.post_id == post.id).count()
     comments_count = db.query(models.Comment).filter(models.Comment.post_id == post.id).count()
     is_liked = db.query(models.Like).filter(models.Like.post_id == post.id, models.Like.user_id == current_user_id).first() is not None
     is_saved = db.query(models.SavedPost).filter(models.SavedPost.post_id == post.id, models.SavedPost.user_id == current_user_id).first() is not None
-    
+
     post_out = schemas.PostOut.from_orm(post)
     post_out.likes_count = likes_count
     post_out.comments_count = comments_count
     post_out.is_liked = is_liked
     post_out.is_saved = is_saved
-    post_out.author_name = post.user.full_name or f"Farmer {post.user.id}"
-    post_out.author_avatar = post.user.profile_picture
-    post_out.author_verified = post.user.is_verified
-    
+
+    # Use passed author to avoid DetachedInstanceError after commit
+    if author is not None:
+        post_out.author_name = author.full_name or f"Farmer {author.id}"
+        post_out.author_avatar = author.profile_picture
+        post_out.author_verified = author.is_verified
+    else:
+        try:
+            post_out.author_name = post.user.full_name or f"Farmer {post.user.id}"
+            post_out.author_avatar = post.user.profile_picture
+            post_out.author_verified = post.user.is_verified
+        except Exception:
+            # Fallback: fetch user manually if lazy-load fails
+            u = db.query(models.User).filter(models.User.id == post.user_id).first()
+            post_out.author_name = u.full_name if u else f"Farmer {post.user_id}"
+            post_out.author_avatar = u.profile_picture if u else None
+            post_out.author_verified = u.is_verified if u else False
+
     # Deserialize images
     if post.images:
         try:
@@ -249,7 +302,7 @@ def prepare_post_out(post, current_user_id, db):
             post_out.images = []
     else:
         post_out.images = [post.image_url] if post.image_url else []
-        
+
     return post_out
 
 # ─── Likes & Comments ───
@@ -259,12 +312,20 @@ def like_post(post_id: int, current_user: models.User = Depends(get_current_user
     if like:
         db.delete(like)
         db.commit()
+        liked = False
     else:
         new_like = models.Like(post_id=post_id, user_id=current_user.id)
         db.add(new_like)
         db.commit()
+        liked = True
+        # Notify post owner
+        post = db.query(models.Post).filter(models.Post.id == post_id).first()
+        if post:
+            actor_name = current_user.full_name or f"Farmer {current_user.id}"
+            create_notification(db, post.user_id, current_user.id, "LIKE",
+                f"{actor_name} liked your post", post_id=post_id)
     likes_count = db.query(models.Like).filter(models.Like.post_id == post_id).count()
-    return {"liked": not bool(like), "likes_count": likes_count}
+    return {"liked": liked, "likes_count": likes_count}
 
 @app.post("/posts/{post_id}/comments", response_model=schemas.CommentOut)
 def comment_post(post_id: int, comment: schemas.CommentCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -272,6 +333,12 @@ def comment_post(post_id: int, comment: schemas.CommentCreate, current_user: mod
     db.add(db_comment)
     db.commit()
     db.refresh(db_comment)
+    # Notify post owner
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if post:
+        actor_name = current_user.full_name or f"Farmer {current_user.id}"
+        create_notification(db, post.user_id, current_user.id, "COMMENT",
+            f"{actor_name} commented on your post", post_id=post_id)
     out = schemas.CommentOut.from_orm(db_comment)
     out.author_name = current_user.full_name or f"Farmer {current_user.id}"
     out.author_avatar = current_user.profile_picture
@@ -311,6 +378,113 @@ def get_saved_posts(current_user: models.User = Depends(get_current_user), db: S
 def get_user_posts(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     posts = db.query(models.Post).filter(models.Post.user_id == current_user.id).order_by(models.Post.created_at.desc()).all()
     return [prepare_post_out(p, current_user.id, db) for p in posts]
+
+# ─── Notifications ───
+@app.get("/notifications", response_model=List[schemas.NotificationOut])
+def get_notifications(
+    skip: int = 0,
+    limit: int = 50,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    notifs = db.query(models.Notification).filter(
+        models.Notification.user_id == current_user.id
+    ).order_by(models.Notification.created_at.desc()).offset(skip).limit(limit).all()
+
+    result = []
+    for n in notifs:
+        out = schemas.NotificationOut.from_orm(n)
+        if n.actor_id:
+            actor = db.query(models.User).filter(models.User.id == n.actor_id).first()
+            out.actor_name = actor.full_name if actor else None
+            out.actor_avatar = actor.profile_picture if actor else None
+        result.append(out)
+    return result
+
+@app.get("/notifications/unread-count")
+def get_unread_count(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    count = db.query(models.Notification).filter(
+        models.Notification.user_id == current_user.id,
+        models.Notification.is_read == False
+    ).count()
+    return {"count": count}
+
+@app.post("/notifications/read-all")
+def mark_all_read(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    db.query(models.Notification).filter(
+        models.Notification.user_id == current_user.id,
+        models.Notification.is_read == False
+    ).update({"is_read": True})
+    db.commit()
+    return {"message": "All notifications marked as read"}
+
+@app.post("/notifications/{notif_id}/read")
+def mark_one_read(notif_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    notif = db.query(models.Notification).filter(
+        models.Notification.id == notif_id,
+        models.Notification.user_id == current_user.id
+    ).first()
+    if notif:
+        notif.is_read = True
+        db.commit()
+    return {"message": "Notification marked as read"}
+
+@app.delete("/notifications")
+def clear_notifications(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    db.query(models.Notification).filter(
+        models.Notification.user_id == current_user.id
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"message": "All notifications cleared"}
+
+# ─── User Search ───
+@app.get("/users/search", response_model=List[schemas.UserSearchOut])
+def search_users(
+    q: str = Query(..., min_length=1),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    from sqlalchemy import or_, func
+    search = f"%{q}%"
+    users = db.query(models.User).filter(
+        models.User.id != current_user.id,
+        or_(
+            models.User.full_name.ilike(search),
+            models.User.email.ilike(search),
+            models.User.username.ilike(search),
+        )
+    ).limit(20).all()
+
+    result = []
+    for u in users:
+        is_following = db.query(models.Follow).filter(
+            models.Follow.follower_id == current_user.id,
+            models.Follow.following_id == u.id
+        ).first() is not None
+        followers_count = db.query(models.Follow).filter(models.Follow.following_id == u.id).count()
+        following_count = db.query(models.Follow).filter(models.Follow.follower_id == u.id).count()
+        out = schemas.UserSearchOut(
+            id=u.id,
+            full_name=u.full_name,
+            username=u.username,
+            email=u.email,
+            profile_picture=u.profile_picture,
+            bio=u.bio,
+            is_verified=u.is_verified,
+            is_following=is_following,
+            followers_count=followers_count,
+            following_count=following_count,
+        )
+        result.append(out)
+    return result
+
+@app.get("/users/{user_id}/is-following")
+def is_following_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    following = db.query(models.Follow).filter(
+        models.Follow.follower_id == current_user.id,
+        models.Follow.following_id == user_id
+    ).first() is not None
+    return {"is_following": following}
 
 # ─── Chat AI ───
 @app.post("/ai/chat", response_model=schemas.ChatMessage)

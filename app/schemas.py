@@ -51,6 +51,22 @@ class UserOut(BaseModel):
 User = UserOut
 
 
+class UserSearchOut(BaseModel):
+    id: int
+    full_name: Optional[str] = None
+    username: Optional[str] = None
+    email: str
+    profile_picture: Optional[str] = None
+    bio: Optional[str] = None
+    is_verified: Optional[bool] = False
+    is_following: bool = False
+    followers_count: int = 0
+    following_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 class RegisterRequest(BaseModel):
     full_name: str
@@ -176,6 +192,7 @@ CommentOut.model_rebuild()
 class FollowOut(BaseModel):
     following: bool
     followers_count: int
+    following_count: Optional[int] = 0
 
 
 # ─── Notification ─────────────────────────────────────────────────────────────
@@ -187,7 +204,9 @@ class NotificationOut(BaseModel):
     is_read: bool
     created_at: datetime
     post_id: Optional[int] = None
+    actor_id: Optional[int] = None
     actor_name: Optional[str] = None
+    actor_avatar: Optional[str] = None
 
     class Config:
         from_attributes = True
