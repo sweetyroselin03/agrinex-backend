@@ -1,6 +1,6 @@
 import requests
 
-BASE_URL = "http://127.0.0.1:8000" # Localhost since we are on the same machine
+BASE_URL = "https://agrinex-backend-c1ig.onrender.com" # Localhost since we are on the same machine
 
 def test_send_otp():
     print(f"Testing /auth/send-otp...")

@@ -1,4 +1,5 @@
-from pydantic import BaseModel
+import json
+from pydantic import BaseModel, validator
 from typing import Optional, List
 from datetime import datetime
 
@@ -152,6 +153,20 @@ class PostOut(BaseModel):
     author_name: Optional[str] = None
     author_avatar: Optional[str] = None
     author_verified: Optional[bool] = False
+
+    @validator('images', pre=True)
+    def parse_images(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, list) else []
+            except Exception:
+                return []
+        return []
 
     class Config:
         from_attributes = True
