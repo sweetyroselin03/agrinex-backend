@@ -349,6 +349,121 @@ class WeatherResponse(BaseModel):
     sunset: Optional[str] = None
     daily_high: Optional[float] = None
     daily_low: Optional[float] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── DM / DIRECT MESSAGING SCHEMAS ───
+
+class MessageAttachmentOut(BaseModel):
+    id: int
+    url: str
+    file_type: str = "image"
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MessageReactionOut(BaseModel):
+    id: int
+    user_id: int
+    emoji: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MessageOut(BaseModel):
+    id: int
+    conversation_id: int
+    sender_id: int
+    sender_name: Optional[str] = None
+    sender_avatar: Optional[str] = None
+    content: Optional[str] = None
+    reply_to_id: Optional[int] = None
+    reply_to_content: Optional[str] = None
+    reply_to_sender: Optional[str] = None
+    is_edited: bool = False
+    is_deleted_everyone: bool = False
+    created_at: datetime
+    updated_at: datetime
+    status: str = "sent"  # "sent", "delivered", "seen"
+    attachments: List[MessageAttachmentOut] = []
+    reactions: List[MessageReactionOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class ConversationParticipantOut(BaseModel):
+    id: int
+    user_id: int
+    full_name: Optional[str] = None
+    username: Optional[str] = None
+    profile_picture: Optional[str] = None
+    is_verified: bool = False
+    is_online: bool = False
+    last_seen: Optional[datetime] = None
+    is_pinned: bool = False
+    is_muted: bool = False
+    is_archived: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class ConversationOut(BaseModel):
+    id: int
+    type: str = "direct"
+    title: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    other_participant: Optional[ConversationParticipantOut] = None
+    last_message: Optional[MessageOut] = None
+    unread_count: int = 0
+    is_pinned: bool = False
+    is_muted: bool = False
+    is_archived: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class MessageCreate(BaseModel):
+    conversation_id: Optional[int] = None
+    recipient_id: Optional[int] = None
+    content: Optional[str] = None
+    reply_to_id: Optional[int] = None
+    attachments: List[str] = []  # Image URLs
+
+
+class MessageEdit(BaseModel):
+    content: str
+
+
+class MessageReactionCreate(BaseModel):
+    emoji: str  # ❤️ 👍 😂 😍 😮 😢
+
+
+class StartConversationRequest(BaseModel):
+    target_user_id: int
+
+
+class BlockUserRequest(BaseModel):
+    user_id: int
+
+
+class UserOnlineStatusOut(BaseModel):
+    user_id: int
+    is_online: bool
+    last_seen: datetime
+
+    class Config:
+        from_attributes = True
+
     soil_moisture: Optional[str] = None
     farming_suitability: Optional[str] = None
     alerts: Optional[List[WeatherAlert]] = []

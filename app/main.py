@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query, WebSocket, WebSocketDisconnect, UploadFile, File
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
@@ -10,6 +10,7 @@ import os
 from datetime import datetime, timedelta
 from . import models, schemas, ai_service, auth_utils, auth_router
 from .database import engine, get_db
+from .websocket_manager import manager as ws_manager
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 
@@ -1407,3 +1408,690 @@ async def get_weather_by_location(
     lon: float = Query(..., description="Longitude"),
 ):
     return await get_weather(lat=lat, lon=lon)
+
+
+# ─── DIRECT MESSAGING (DM) & WEBSOCKET ENDPOINTS ───
+
+def check_user_blocked(db: Session, user1_id: int, user2_id: int) -> bool:
+    from sqlalchemy import or_, and_
+    blocked = db.query(models.BlockedUser).filter(
+        or_(
+            and_(models.BlockedUser.blocker_id == user1_id, models.BlockedUser.blocked_id == user2_id),
+            and_(models.BlockedUser.blocker_id == user2_id, models.BlockedUser.blocked_id == user1_id)
+        )
+    ).first()
+    return blocked is not None
+
+def prepare_message_out(msg: models.Message, current_user_id: int, db: Session) -> schemas.MessageOut:
+    content = "This message was deleted" if msg.is_deleted_everyone else msg.content
+
+    reply_content = None
+    reply_sender = None
+    if msg.reply_to_id and not msg.is_deleted_everyone:
+        parent_msg = db.query(models.Message).filter(models.Message.id == msg.reply_to_id).first()
+        if parent_msg:
+            reply_content = "This message was deleted" if parent_msg.is_deleted_everyone else parent_msg.content
+            p_sender = db.query(models.User).filter(models.User.id == parent_msg.sender_id).first()
+            if p_sender:
+                reply_sender = p_sender.full_name or f"Farmer {p_sender.id}"
+
+    read_entry = db.query(models.MessageRead).filter(
+        models.MessageRead.message_id == msg.id,
+        models.MessageRead.user_id != msg.sender_id
+    ).first()
+    status_str = read_entry.status if read_entry else "sent"
+
+    sender_u = db.query(models.User).filter(models.User.id == msg.sender_id).first()
+    sender_name = sender_u.full_name if sender_u else f"Farmer {msg.sender_id}"
+    sender_avatar = sender_u.profile_picture if sender_u else None
+
+    attachments_out = [schemas.MessageAttachmentOut.from_orm(a) for a in msg.attachments]
+    reactions_out = [schemas.MessageReactionOut.from_orm(r) for r in msg.reactions]
+
+    return schemas.MessageOut(
+        id=msg.id,
+        conversation_id=msg.conversation_id,
+        sender_id=msg.sender_id,
+        sender_name=sender_name,
+        sender_avatar=sender_avatar,
+        content=content,
+        reply_to_id=msg.reply_to_id,
+        reply_to_content=reply_content,
+        reply_to_sender=reply_sender,
+        is_edited=msg.is_edited,
+        is_deleted_everyone=msg.is_deleted_everyone,
+        created_at=msg.created_at,
+        updated_at=msg.updated_at,
+        status=status_str,
+        attachments=attachments_out,
+        reactions=reactions_out
+    )
+
+def prepare_conversation_out(conv: models.Conversation, current_user_id: int, db: Session) -> schemas.ConversationOut:
+    curr_part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == conv.id,
+        models.Participant.user_id == current_user_id
+    ).first()
+
+    is_pinned = curr_part.is_pinned if curr_part else False
+    is_muted = curr_part.is_muted if curr_part else False
+    is_archived = curr_part.is_archived if curr_part else False
+    last_read_at = curr_part.last_read_at if curr_part else conv.created_at
+
+    other_part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == conv.id,
+        models.Participant.user_id != current_user_id
+    ).first()
+
+    other_user_out = None
+    if other_part:
+        ou = db.query(models.User).filter(models.User.id == other_part.user_id).first()
+        if ou:
+            status_entry = db.query(models.UserOnlineStatus).filter(models.UserOnlineStatus.user_id == ou.id).first()
+            is_online = ws_manager.is_online(ou.id) or (status_entry.is_online if status_entry else False)
+            last_seen = status_entry.last_seen if status_entry else None
+            other_user_out = schemas.ConversationParticipantOut(
+                id=other_part.id,
+                user_id=ou.id,
+                full_name=ou.full_name,
+                username=ou.username,
+                profile_picture=ou.profile_picture,
+                is_verified=ou.is_verified,
+                is_online=is_online,
+                last_seen=last_seen,
+                is_pinned=is_pinned,
+                is_muted=is_muted,
+                is_archived=is_archived
+            )
+
+    deleted_ids = [d.message_id for d in db.query(models.MessageDeletedForUser.message_id).filter(models.MessageDeletedForUser.user_id == current_user_id).all()]
+    query_last = db.query(models.Message).filter(models.Message.conversation_id == conv.id)
+    if deleted_ids:
+        query_last = query_last.filter(~models.Message.id.in_(deleted_ids))
+    last_msg = query_last.order_by(models.Message.created_at.desc()).first()
+
+    last_msg_out = prepare_message_out(last_msg, current_user_id, db) if last_msg else None
+
+    query_unread = db.query(models.Message).filter(
+        models.Message.conversation_id == conv.id,
+        models.Message.sender_id != current_user_id,
+        models.Message.created_at > last_read_at
+    )
+    if deleted_ids:
+        query_unread = query_unread.filter(~models.Message.id.in_(deleted_ids))
+    unread_cnt = query_unread.count()
+
+    return schemas.ConversationOut(
+        id=conv.id,
+        type=conv.type,
+        title=conv.title,
+        created_at=conv.created_at,
+        updated_at=conv.updated_at,
+        other_participant=other_user_out,
+        last_message=last_msg_out,
+        unread_count=unread_cnt,
+        is_pinned=is_pinned,
+        is_muted=is_muted,
+        is_archived=is_archived
+    )
+
+
+@app.get("/messages", response_model=List[schemas.ConversationOut])
+@app.get("/api/conversations", response_model=List[schemas.ConversationOut])
+def get_user_conversations(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    parts = db.query(models.Participant).filter(models.Participant.user_id == current_user.id).all()
+    conv_ids = [p.conversation_id for p in parts]
+    if not conv_ids:
+        return []
+
+    convs = db.query(models.Conversation).filter(models.Conversation.id.in_(conv_ids)).order_by(models.Conversation.updated_at.desc()).all()
+    res = [prepare_conversation_out(c, current_user.id, db) for c in convs]
+    res.sort(key=lambda x: (not x.is_pinned, x.updated_at), reverse=True)
+    return res
+
+
+@app.post("/messages/start", response_model=schemas.ConversationOut)
+@app.post("/api/conversations/start", response_model=schemas.ConversationOut)
+def start_conversation(req: schemas.StartConversationRequest, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if req.target_user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot start a conversation with yourself")
+
+    target = db.query(models.User).filter(models.User.id == req.target_user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    if check_user_blocked(db, current_user.id, req.target_user_id):
+        raise HTTPException(status_code=403, detail="Cannot message this user due to block settings")
+
+    p1 = db.query(models.Participant.conversation_id).filter(models.Participant.user_id == current_user.id).subquery()
+    existing = db.query(models.Participant.conversation_id).filter(
+        models.Participant.conversation_id.in_(p1),
+        models.Participant.user_id == req.target_user_id
+    ).first()
+
+    if existing:
+        conv = db.query(models.Conversation).filter(models.Conversation.id == existing.conversation_id).first()
+    else:
+        conv = models.Conversation(type="direct")
+        db.add(conv)
+        db.commit()
+        db.refresh(conv)
+
+        part1 = models.Participant(conversation_id=conv.id, user_id=current_user.id)
+        part2 = models.Participant(conversation_id=conv.id, user_id=req.target_user_id)
+        db.add_all([part1, part2])
+        db.commit()
+
+    return prepare_conversation_out(conv, current_user.id, db)
+
+
+@app.get("/messages/{conversation_id}", response_model=List[schemas.MessageOut])
+@app.get("/api/conversations/{conversation_id}/messages", response_model=List[schemas.MessageOut])
+def get_conversation_messages(
+    conversation_id: int,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == conversation_id,
+        models.Participant.user_id == current_user.id
+    ).first()
+    if not part:
+        raise HTTPException(status_code=403, detail="Not a participant in this conversation")
+
+    deleted_ids = [d.message_id for d in db.query(models.MessageDeletedForUser.message_id).filter(models.MessageDeletedForUser.user_id == current_user.id).all()]
+    query = db.query(models.Message).filter(models.Message.conversation_id == conversation_id)
+    if deleted_ids:
+        query = query.filter(~models.Message.id.in_(deleted_ids))
+
+    messages = query.order_by(models.Message.created_at.asc()).offset(skip).limit(limit).all()
+
+    unread_messages = [m for m in messages if m.sender_id != current_user.id]
+    if unread_messages:
+        for m in unread_messages:
+            read_entry = db.query(models.MessageRead).filter(
+                models.MessageRead.message_id == m.id,
+                models.MessageRead.user_id == current_user.id
+            ).first()
+            if not read_entry:
+                db.add(models.MessageRead(message_id=m.id, user_id=current_user.id, status="seen"))
+            else:
+                read_entry.status = "seen"
+        part.last_read_at = datetime.utcnow()
+        db.commit()
+
+        other_parts = db.query(models.Participant.user_id).filter(
+            models.Participant.conversation_id == conversation_id,
+            models.Participant.user_id != current_user.id
+        ).all()
+        other_uids = [p.user_id for p in other_parts]
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(ws_manager.broadcast_read_receipt(conversation_id, current_user.id, [m.id for m in unread_messages], other_uids))
+        except Exception:
+            pass
+
+    return [prepare_message_out(m, current_user.id, db) for m in messages]
+
+
+@app.post("/messages/send", response_model=schemas.MessageOut)
+@app.post("/api/messages/send", response_model=schemas.MessageOut)
+def send_message(msg_in: schemas.MessageCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    conv_id = msg_in.conversation_id
+
+    if not conv_id and msg_in.recipient_id:
+        start_res = start_conversation(schemas.StartConversationRequest(target_user_id=msg_in.recipient_id), current_user, db)
+        conv_id = start_res.id
+
+    if not conv_id:
+        raise HTTPException(status_code=400, detail="Must specify conversation_id or recipient_id")
+
+    part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == conv_id,
+        models.Participant.user_id == current_user.id
+    ).first()
+    if not part:
+        raise HTTPException(status_code=403, detail="Not a participant in this conversation")
+
+    other_parts = db.query(models.Participant.user_id).filter(
+        models.Participant.conversation_id == conv_id,
+        models.Participant.user_id != current_user.id
+    ).all()
+    other_uids = [p.user_id for p in other_parts]
+
+    for ou_id in other_uids:
+        if check_user_blocked(db, current_user.id, ou_id):
+            raise HTTPException(status_code=403, detail="Cannot send message due to block settings")
+
+    if not msg_in.content and not msg_in.attachments:
+        raise HTTPException(status_code=400, detail="Message content or image attachment required")
+
+    message = models.Message(
+        conversation_id=conv_id,
+        sender_id=current_user.id,
+        content=msg_in.content.strip() if msg_in.content else None,
+        reply_to_id=msg_in.reply_to_id
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+
+    for att_url in msg_in.attachments:
+        if att_url.strip():
+            db.add(models.MessageAttachment(message_id=message.id, url=att_url.strip(), file_type="image"))
+    db.commit()
+    db.refresh(message)
+
+    conv = db.query(models.Conversation).filter(models.Conversation.id == conv_id).first()
+    if conv:
+        conv.updated_at = datetime.utcnow()
+        db.commit()
+
+    msg_out = prepare_message_out(message, current_user.id, db)
+
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(ws_manager.broadcast_message(msg_out.dict(), other_uids + [current_user.id]))
+    except Exception as e:
+        logger.warning(f"WebSocket broadcast error: {e}")
+
+    for ou_id in other_uids:
+        actor_name = current_user.full_name or f"Farmer {current_user.id}"
+        create_notification(db, ou_id, current_user.id, "MESSAGE", f"{actor_name} sent you a message")
+
+    return msg_out
+
+
+@app.patch("/messages/edit", response_model=schemas.MessageOut)
+@app.patch("/api/messages/{message_id}", response_model=schemas.MessageOut)
+def edit_message(
+    msg_edit: schemas.MessageEdit,
+    message_id: Optional[int] = None,
+    msg_id: Optional[int] = Query(None),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    target_id = message_id or msg_id
+    if not target_id:
+        raise HTTPException(status_code=400, detail="Message ID required")
+
+    message = db.query(models.Message).filter(models.Message.id == target_id, models.Message.sender_id == current_user.id).first()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found or unauthorized")
+
+    time_diff = (datetime.utcnow() - message.created_at).total_seconds()
+    if time_diff > 900:
+        raise HTTPException(status_code=400, detail="Messages can only be edited within 15 minutes of sending")
+
+    message.content = msg_edit.content.strip()
+    message.is_edited = True
+    db.commit()
+    db.refresh(message)
+
+    msg_out = prepare_message_out(message, current_user.id, db)
+
+    other_parts = db.query(models.Participant.user_id).filter(
+        models.Participant.conversation_id == message.conversation_id
+    ).all()
+    uids = [p.user_id for p in other_parts]
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(ws_manager.broadcast_to_users(uids, {"type": "message_edited", "message": msg_out.dict()}))
+    except Exception:
+        pass
+
+    return msg_out
+
+
+@app.delete("/messages/delete")
+@app.delete("/api/messages/{message_id}")
+def delete_message(
+    message_id: Optional[int] = None,
+    msg_id: Optional[int] = Query(None),
+    delete_type: str = Query(default="for_me", description="for_me or everyone"),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    target_id = message_id or msg_id
+    if not target_id:
+        raise HTTPException(status_code=400, detail="Message ID required")
+
+    message = db.query(models.Message).filter(models.Message.id == target_id).first()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == message.conversation_id,
+        models.Participant.user_id == current_user.id
+    ).first()
+    if not part:
+        raise HTTPException(status_code=403, detail="Not a participant in this conversation")
+
+    if delete_type == "everyone":
+        if message.sender_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Only sender can delete message for everyone")
+        message.is_deleted_everyone = True
+        message.content = None
+        db.commit()
+    else:
+        existing = db.query(models.MessageDeletedForUser).filter(
+            models.MessageDeletedForUser.message_id == target_id,
+            models.MessageDeletedForUser.user_id == current_user.id
+        ).first()
+        if not existing:
+            db.add(models.MessageDeletedForUser(message_id=target_id, user_id=current_user.id))
+            db.commit()
+
+    other_parts = db.query(models.Participant.user_id).filter(
+        models.Participant.conversation_id == message.conversation_id
+    ).all()
+    uids = [p.user_id for p in other_parts]
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(ws_manager.broadcast_to_users(uids, {
+                "type": "message_deleted",
+                "message_id": target_id,
+                "delete_type": delete_type,
+                "user_id": current_user.id
+            }))
+    except Exception:
+        pass
+
+    return {"message": "Message deleted successfully", "delete_type": delete_type}
+
+
+@app.post("/messages/read")
+@app.post("/api/messages/{conversation_id}/read")
+def mark_messages_read(
+    conversation_id: Optional[int] = None,
+    conv_id: Optional[int] = Query(None),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    target_id = conversation_id or conv_id
+    if not target_id:
+        raise HTTPException(status_code=400, detail="Conversation ID required")
+
+    part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == target_id,
+        models.Participant.user_id == current_user.id
+    ).first()
+    if not part:
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    part.last_read_at = datetime.utcnow()
+
+    unread_msgs = db.query(models.Message).filter(
+        models.Message.conversation_id == target_id,
+        models.Message.sender_id != current_user.id
+    ).all()
+
+    for m in unread_msgs:
+        read_e = db.query(models.MessageRead).filter(
+            models.MessageRead.message_id == m.id,
+            models.MessageRead.user_id == current_user.id
+        ).first()
+        if not read_e:
+            db.add(models.MessageRead(message_id=m.id, user_id=current_user.id, status="seen"))
+        else:
+            read_e.status = "seen"
+    db.commit()
+
+    other_parts = db.query(models.Participant.user_id).filter(
+        models.Participant.conversation_id == target_id,
+        models.Participant.user_id != current_user.id
+    ).all()
+    other_uids = [p.user_id for p in other_parts]
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(ws_manager.broadcast_read_receipt(target_id, current_user.id, [m.id for m in unread_msgs], other_uids))
+    except Exception:
+        pass
+
+    return {"status": "success", "conversation_id": target_id}
+
+
+@app.post("/messages/reaction", response_model=schemas.MessageOut)
+@app.post("/api/messages/{message_id}/react", response_model=schemas.MessageOut)
+def toggle_message_reaction(
+    reaction_in: schemas.MessageReactionCreate,
+    message_id: Optional[int] = None,
+    msg_id: Optional[int] = Query(None),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    target_id = message_id or msg_id
+    if not target_id:
+        raise HTTPException(status_code=400, detail="Message ID required")
+
+    message = db.query(models.Message).filter(models.Message.id == target_id).first()
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == message.conversation_id,
+        models.Participant.user_id == current_user.id
+    ).first()
+    if not part:
+        raise HTTPException(status_code=403, detail="Not a participant")
+
+    existing = db.query(models.MessageReaction).filter(
+        models.MessageReaction.message_id == target_id,
+        models.MessageReaction.user_id == current_user.id,
+        models.MessageReaction.emoji == reaction_in.emoji
+    ).first()
+
+    if existing:
+        db.delete(existing)
+    else:
+        db.add(models.MessageReaction(message_id=target_id, user_id=current_user.id, emoji=reaction_in.emoji))
+    db.commit()
+    db.refresh(message)
+
+    msg_out = prepare_message_out(message, current_user.id, db)
+
+    all_parts = db.query(models.Participant.user_id).filter(
+        models.Participant.conversation_id == message.conversation_id
+    ).all()
+    uids = [p.user_id for p in all_parts]
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(ws_manager.broadcast_to_users(uids, {"type": "message_reaction", "message": msg_out.dict()}))
+    except Exception:
+        pass
+
+    return msg_out
+
+
+@app.post("/api/conversations/{conversation_id}/pin")
+def pin_conversation(conversation_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == conversation_id,
+        models.Participant.user_id == current_user.id
+    ).first()
+    if not part:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    part.is_pinned = not part.is_pinned
+    db.commit()
+    return {"is_pinned": part.is_pinned}
+
+
+@app.post("/api/conversations/{conversation_id}/mute")
+def mute_conversation(conversation_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == conversation_id,
+        models.Participant.user_id == current_user.id
+    ).first()
+    if not part:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    part.is_muted = not part.is_muted
+    db.commit()
+    return {"is_muted": part.is_muted}
+
+
+@app.post("/api/conversations/{conversation_id}/archive")
+def archive_conversation(conversation_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    part = db.query(models.Participant).filter(
+        models.Participant.conversation_id == conversation_id,
+        models.Participant.user_id == current_user.id
+    ).first()
+    if not part:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    part.is_archived = not part.is_archived
+    db.commit()
+    return {"is_archived": part.is_archived}
+
+
+# ─── BLOCK USER SYSTEM ───
+
+@app.post("/api/users/{user_id}/block")
+def block_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot block yourself")
+
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    existing = db.query(models.BlockedUser).filter(
+        models.BlockedUser.blocker_id == current_user.id,
+        models.BlockedUser.blocked_id == user_id
+    ).first()
+
+    if not existing:
+        db.add(models.BlockedUser(blocker_id=current_user.id, blocked_id=user_id))
+        
+        f1 = db.query(models.Follow).filter(models.Follow.follower_id == current_user.id, models.Follow.following_id == user_id).first()
+        if f1:
+            db.delete(f1)
+        f2 = db.query(models.Follow).filter(models.Follow.follower_id == user_id, models.Follow.following_id == current_user.id).first()
+        if f2:
+            db.delete(f2)
+            
+        db.commit()
+
+    return {"blocked": True, "user_id": user_id}
+
+
+@app.delete("/api/users/{user_id}/block")
+def unblock_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    existing = db.query(models.BlockedUser).filter(
+        models.BlockedUser.blocker_id == current_user.id,
+        models.BlockedUser.blocked_id == user_id
+    ).first()
+
+    if existing:
+        db.delete(existing)
+        db.commit()
+
+    return {"blocked": False, "user_id": user_id}
+
+
+@app.get("/api/users/blocked", response_model=List[schemas.UserSearchOut])
+def get_blocked_users(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    blocked_entries = db.query(models.BlockedUser).filter(models.BlockedUser.blocker_id == current_user.id).all()
+    b_ids = [b.blocked_id for b in blocked_entries]
+    if not b_ids:
+        return []
+    users = db.query(models.User).filter(models.User.id.in_(b_ids)).all()
+    return [
+        schemas.UserSearchOut(
+            id=u.id,
+            full_name=u.full_name,
+            display_name=u.full_name or f"Farmer {u.id}",
+            username=u.username,
+            email=u.email,
+            village=u.village or "Agricultural Hub",
+            profile_picture=u.profile_picture,
+            profile_photo=u.profile_picture,
+            bio=u.bio,
+            verified=u.is_verified,
+            is_verified=u.is_verified,
+            followers=0,
+            followers_count=0,
+            following_count=0,
+            is_following=False,
+            isFollowing=False
+        ) for u in users
+    ]
+
+
+# ─── MEDIA UPLOAD ENDPOINT ───
+
+@app.post("/api/media/upload")
+async def upload_media_file(file: UploadFile = File(...), current_user: models.User = Depends(get_current_user)):
+    try:
+        contents = await file.read()
+        import base64
+        ext = file.filename.split(".")[-1] if file.filename and "." in file.filename else "jpg"
+        mime_type = file.content_type or f"image/{ext}"
+        base64_str = base64.b64encode(contents).decode("utf-8")
+        data_url = f"data:{mime_type};base64,{base64_str}"
+        return {"url": data_url, "filename": file.filename}
+    except Exception as e:
+        logger.error(f"Media upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload media: {str(e)}")
+
+
+# ─── WEBSOCKET ROUTE ───
+
+@app.websocket("/ws/chat/{user_id}")
+async def websocket_chat_endpoint(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
+    await ws_manager.connect(websocket, user_id)
+
+    status_entry = db.query(models.UserOnlineStatus).filter(models.UserOnlineStatus.user_id == user_id).first()
+    if not status_entry:
+        status_entry = models.UserOnlineStatus(user_id=user_id, is_online=True, last_seen=datetime.utcnow())
+        db.add(status_entry)
+    else:
+        status_entry.is_online = True
+        status_entry.last_seen = datetime.utcnow()
+    db.commit()
+
+    try:
+        while True:
+            data_text = await websocket.receive_text()
+            try:
+                data = json.loads(data_text)
+                msg_type = data.get("type")
+
+                if msg_type == "typing":
+                    conv_id = data.get("conversation_id")
+                    is_typing = data.get("is_typing", False)
+                    sender_name = data.get("sender_name", f"Farmer {user_id}")
+                    if conv_id:
+                        other_parts = db.query(models.Participant.user_id).filter(
+                            models.Participant.conversation_id == conv_id,
+                            models.Participant.user_id != user_id
+                        ).all()
+                        target_ids = [p.user_id for p in other_parts]
+                        await ws_manager.broadcast_typing(conv_id, user_id, sender_name, is_typing, target_ids)
+
+                elif msg_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+
+            except Exception as parse_err:
+                logger.warning(f"WS data parse error for user {user_id}: {parse_err}")
+
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket, user_id)
+        status_entry = db.query(models.UserOnlineStatus).filter(models.UserOnlineStatus.user_id == user_id).first()
+        if status_entry:
+            status_entry.is_online = False
+            status_entry.last_seen = datetime.utcnow()
+            db.commit()
+

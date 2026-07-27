@@ -166,3 +166,138 @@ class OTPCode(Base):
     attempts = Column(Integer, default=0)
     last_sent_at = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ─── DIRECT MESSAGING (DM) MODELS ───
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(String, default="direct")  # "direct" or "group"
+    title = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    participants = relationship("Participant", back_populates="conversation", cascade="all, delete-orphan")
+    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan")
+
+
+class Participant(Base):
+    __tablename__ = "participants"
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    is_pinned = Column(Boolean, default=False)
+    is_muted = Column(Boolean, default=False)
+    is_archived = Column(Boolean, default=False)
+    last_read_at = Column(DateTime, default=datetime.utcnow)
+    joined_at = Column(DateTime, default=datetime.utcnow)
+
+    conversation = relationship("Conversation", back_populates="participants")
+    user = relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        UniqueConstraint('conversation_id', 'user_id', name='unique_conversation_participant'),
+    )
+
+
+class Message(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    content = Column(Text, nullable=True)
+    reply_to_id = Column(Integer, ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
+    is_edited = Column(Boolean, default=False)
+    is_deleted_everyone = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    conversation = relationship("Conversation", back_populates="messages")
+    sender = relationship("User", foreign_keys=[sender_id])
+    reply_to = relationship("Message", remote_side=[id])
+    attachments = relationship("MessageAttachment", back_populates="message", cascade="all, delete-orphan")
+    reactions = relationship("MessageReaction", back_populates="message", cascade="all, delete-orphan")
+    reads = relationship("MessageRead", back_populates="message", cascade="all, delete-orphan")
+
+
+class MessageRead(Base):
+    __tablename__ = "message_reads"
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String, default="seen")  # "sent", "delivered", "seen"
+    read_at = Column(DateTime, default=datetime.utcnow)
+
+    message = relationship("Message", back_populates="reads")
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint('message_id', 'user_id', name='unique_message_user_read'),
+    )
+
+
+class MessageReaction(Base):
+    __tablename__ = "message_reactions"
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    emoji = Column(String, nullable=False)  # ❤️ 👍 😂 😍 😮 😢
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    message = relationship("Message", back_populates="reactions")
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint('message_id', 'user_id', 'emoji', name='unique_message_user_emoji'),
+    )
+
+
+class MessageAttachment(Base):
+    __tablename__ = "message_attachments"
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    url = Column(String, nullable=False)
+    file_type = Column(String, default="image")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    message = relationship("Message", back_populates="attachments")
+
+
+class MessageDeletedForUser(Base):
+    __tablename__ = "message_deleted_for_users"
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('message_id', 'user_id', name='unique_message_deleted_user'),
+    )
+
+
+class BlockedUser(Base):
+    __tablename__ = "blocked_users"
+    id = Column(Integer, primary_key=True, index=True)
+    blocker_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    blocked_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    blocker = relationship("User", foreign_keys=[blocker_id])
+    blocked = relationship("User", foreign_keys=[blocked_id])
+
+    __table_args__ = (
+        UniqueConstraint('blocker_id', 'blocked_id', name='unique_blocker_blocked'),
+        CheckConstraint('blocker_id != blocked_id', name='check_cannot_block_self'),
+    )
+
+
+class UserOnlineStatus(Base):
+    __tablename__ = "user_online_status"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    is_online = Column(Boolean, default=False)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
