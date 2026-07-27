@@ -31,7 +31,6 @@ def sync_db():
         add_column_if_missing(conn, "users", "username", "VARCHAR")
         add_column_if_missing(conn, "users", "experience", "VARCHAR")
         add_column_if_missing(conn, "users", "crop_specialization", "VARCHAR")
-        add_column_if_missing(conn, "users", "cover_photo", "VARCHAR")
         add_column_if_missing(conn, "users", "website", "VARCHAR")
         add_column_if_missing(conn, "chat_messages", "conversation_id", "VARCHAR")
         add_column_if_missing(conn, "posts", "images", "TEXT")

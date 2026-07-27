@@ -20,7 +20,6 @@ class User(Base):
     crop_specialization = Column(String, nullable=True, index=True) # Added
     crop_types = Column(String, nullable=True)
     profile_picture = Column(String, nullable=True)
-    cover_photo = Column(String, nullable=True)
     bio = Column(String, nullable=True)
     website = Column(String, nullable=True)
     is_verified = Column(Boolean, default=True)

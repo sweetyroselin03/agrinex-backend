@@ -149,7 +149,6 @@ def prepare_user_out(user_obj: models.User, current_user_id: Optional[int], db: 
     user_out.specialization = user_obj.crop_specialization or "Agriculture Specialist"
     user_out.joined_date = user_obj.created_at
     user_out.profile_photo = user_obj.profile_picture
-    user_out.cover_photo = user_obj.cover_photo
     user_out.followers_count = followers_count
     user_out.following_count = following_count
     user_out.posts_count = posts_count

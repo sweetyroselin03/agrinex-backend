@@ -24,7 +24,6 @@ class UserUpdate(BaseModel):
     crop_specialization: Optional[str] = None
     crop_types: Optional[str] = None
     profile_picture: Optional[str] = None
-    cover_photo: Optional[str] = None
     bio: Optional[str] = None
     website: Optional[str] = None
 
@@ -45,7 +44,6 @@ class UserOut(BaseModel):
     crop_types: Optional[str] = None
     profile_picture: Optional[str] = None
     profile_photo: Optional[str] = None
-    cover_photo: Optional[str] = None
     bio: Optional[str] = None
     website: Optional[str] = None
     is_verified: Optional[bool] = False
