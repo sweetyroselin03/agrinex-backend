@@ -16,8 +16,13 @@ from jose import JWTError, jwt
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
-# Create tables
+# Create tables and sync schema
 models.Base.metadata.create_all(bind=engine)
+try:
+    import sync_db
+    sync_db.sync_db()
+except Exception as sync_err:
+    logging.getLogger("uvicorn.error").warning(f"[Startup DB Sync Warning] {sync_err}")
 
 logger_startup = logging.getLogger("uvicorn.error")
 logger_startup.info("[Startup] Database tables synchronized via SQLAlchemy ORM.")
@@ -33,15 +38,27 @@ app = FastAPI(
 
 # CORS configuration
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "")
+default_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+    "https://agrinex-web.vercel.app",
+    "https://agrinex-backend-c1ig.onrender.com",
+]
+
 if allowed_origins_str:
-    allow_origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
+    env_origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
+    allow_origins = list(set(default_origins + env_origins))
 else:
-    allow_origins = ["*"]
+    allow_origins = default_origins
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
-    allow_credentials=True if allow_origins != ["*"] else False,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
