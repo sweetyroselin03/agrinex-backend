@@ -14,8 +14,9 @@ if os.path.exists(TEST_DB_FILE):
 os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB_FILE}"
 
 from app.database import Base, get_db
-from app.main import app, get_current_user
+from app.main import app, get_current_user, get_optional_current_user
 from app import models
+
 
 engine = create_engine(f"sqlite:///{TEST_DB_FILE}", connect_args={"check_same_thread": False})
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -130,22 +131,45 @@ def test_edit_and_delete_message():
 
 def test_pin_mute_archive_and_block():
     app.dependency_overrides[get_current_user] = get_user_1
+    app.dependency_overrides[get_optional_current_user] = get_user_1
     res_start = client.post("/messages/start", json={"target_user_id": u2.id})
     conv_id = res_start.json()["id"]
+
 
     # Pin conversation
     res_pin = client.post(f"/api/conversations/{conv_id}/pin")
     assert res_pin.status_code == 200
     assert res_pin.json()["is_pinned"] == True
 
+    # Test block status endpoint
+    res_status = client.get(f"/api/users/{u2.id}/block-status")
+    assert res_status.status_code == 200
+    assert res_status.json()["is_blocked"] == False
+
     # Block user 2
     res_block = client.post(f"/api/users/{u2.id}/block")
     assert res_block.status_code == 200
     assert res_block.json()["blocked"] == True
 
+    # Check block status now
+    res_status2 = client.get(f"/api/users/{u2.id}/block-status")
+    assert res_status2.status_code == 200
+    assert res_status2.json()["is_blocked"] == True
+    assert res_status2.json()["blocked_by_me"] == True
+
+    # Duplicate block should return 409
+    res_dup = client.post(f"/api/users/{u2.id}/block")
+    assert res_dup.status_code == 409
+
     # Try sending msg to blocked user 2 -> should fail 403
     res_fail = client.post("/messages/send", json={"recipient_id": u2.id, "content": "Hello?"})
     assert res_fail.status_code == 403, res_fail.text
+
+    # Search users should exclude blocked user 2
+    res_search = client.get("/api/users/search?q=farmer2")
+    assert res_search.status_code == 200
+    search_ids = [u["id"] for u in res_search.json()]
+    assert u2.id not in search_ids
 
     # Unblock user 2
     res_unblock = client.delete(f"/api/users/{u2.id}/block")
@@ -166,3 +190,4 @@ if __name__ == "__main__":
     print("\n==============================================")
     print("ALL DM BACKEND TESTS PASSED SUCCESSFULLY!")
     print("==============================================")
+

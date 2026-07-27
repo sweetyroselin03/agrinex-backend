@@ -204,7 +204,9 @@ def search_users(
         )
     )
     if current_id:
-        query = query.filter(models.User.id != current_id)
+        blocked_uids = get_blocked_user_ids(db, current_id)
+        exclude_uids = blocked_uids | {current_id}
+        query = query.filter(~models.User.id.in_(exclude_uids))
 
     users = query.offset(skip).limit(limit).all()
 
@@ -248,10 +250,11 @@ def get_suggested_users(
     db: Session = Depends(get_db)
 ):
     following_ids = [f.following_id for f in db.query(models.Follow.following_id).filter(models.Follow.follower_id == current_user.id).all()]
-    exclude_ids = set(following_ids)
-    exclude_ids.add(current_user.id)
+    blocked_ids = get_blocked_user_ids(db, current_user.id)
+    exclude_ids = set(following_ids) | blocked_ids | {current_user.id}
 
     query = db.query(models.User).filter(~models.User.id.in_(exclude_ids))
+
     
     suggested = []
     if current_user.crop_specialization or current_user.village:
@@ -1429,6 +1432,8 @@ async def get_weather_by_location(
 # ─── DIRECT MESSAGING (DM) & WEBSOCKET ENDPOINTS ───
 
 def check_user_blocked(db: Session, user1_id: int, user2_id: int) -> bool:
+    if not user1_id or not user2_id or user1_id == user2_id:
+        return False
     from sqlalchemy import or_, and_
     blocked = db.query(models.BlockedUser).filter(
         or_(
@@ -1437,6 +1442,14 @@ def check_user_blocked(db: Session, user1_id: int, user2_id: int) -> bool:
         )
     ).first()
     return blocked is not None
+
+def get_blocked_user_ids(db: Session, user_id: int) -> set:
+    if not user_id:
+        return set()
+    b1 = [b.blocked_id for b in db.query(models.BlockedUser.blocked_id).filter(models.BlockedUser.blocker_id == user_id).all()]
+    b2 = [b.blocker_id for b in db.query(models.BlockedUser.blocker_id).filter(models.BlockedUser.blocked_id == user_id).all()]
+    return set(b1 + b2)
+
 
 def prepare_message_out(msg: models.Message, current_user_id: int, db: Session) -> schemas.MessageOut:
     content = "This message was deleted" if msg.is_deleted_everyone else msg.content
@@ -1681,7 +1694,15 @@ def send_message(msg_in: schemas.MessageCreate, current_user: models.User = Depe
 
     for ou_id in other_uids:
         if check_user_blocked(db, current_user.id, ou_id):
-            raise HTTPException(status_code=403, detail="Cannot send message due to block settings")
+            blocked_by_me = db.query(models.BlockedUser).filter(
+                models.BlockedUser.blocker_id == current_user.id,
+                models.BlockedUser.blocked_id == ou_id
+            ).first() is not None
+            if blocked_by_me:
+                raise HTTPException(status_code=403, detail="You cannot send messages because you have blocked this user.")
+            else:
+                raise HTTPException(status_code=403, detail="You cannot send messages because this user has blocked you.")
+
 
     if not msg_in.content and not msg_in.attachments:
         raise HTTPException(status_code=400, detail="Message content or image attachment required")
@@ -1974,6 +1995,32 @@ def archive_conversation(conversation_id: int, current_user: models.User = Depen
 
 # ─── BLOCK USER SYSTEM ───
 
+@app.get("/users/{user_id}/block-status", response_model=schemas.BlockStatusOut)
+@app.get("/api/users/{user_id}/block-status", response_model=schemas.BlockStatusOut)
+def get_user_block_status(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    blocked_by_me = db.query(models.BlockedUser).filter(
+        models.BlockedUser.blocker_id == current_user.id,
+        models.BlockedUser.blocked_id == user_id
+    ).first() is not None
+
+    blocked_by_them = db.query(models.BlockedUser).filter(
+        models.BlockedUser.blocker_id == user_id,
+        models.BlockedUser.blocked_id == current_user.id
+    ).first() is not None
+
+    return schemas.BlockStatusOut(
+        is_blocked=blocked_by_me or blocked_by_them,
+        blocked_by_me=blocked_by_me,
+        blocked_by_them=blocked_by_them,
+        user_id=user_id
+    )
+
+
+@app.post("/users/{user_id}/block")
 @app.post("/api/users/{user_id}/block")
 def block_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     if user_id == current_user.id:
@@ -1988,23 +2035,30 @@ def block_user(user_id: int, current_user: models.User = Depends(get_current_use
         models.BlockedUser.blocked_id == user_id
     ).first()
 
-    if not existing:
-        db.add(models.BlockedUser(blocker_id=current_user.id, blocked_id=user_id))
-        
-        f1 = db.query(models.Follow).filter(models.Follow.follower_id == current_user.id, models.Follow.following_id == user_id).first()
-        if f1:
-            db.delete(f1)
-        f2 = db.query(models.Follow).filter(models.Follow.follower_id == user_id, models.Follow.following_id == current_user.id).first()
-        if f2:
-            db.delete(f2)
-            
-        db.commit()
+    if existing:
+        raise HTTPException(status_code=409, detail="User is already blocked")
+
+    db.add(models.BlockedUser(blocker_id=current_user.id, blocked_id=user_id))
+
+    f1 = db.query(models.Follow).filter(models.Follow.follower_id == current_user.id, models.Follow.following_id == user_id).first()
+    if f1:
+        db.delete(f1)
+    f2 = db.query(models.Follow).filter(models.Follow.follower_id == user_id, models.Follow.following_id == current_user.id).first()
+    if f2:
+        db.delete(f2)
+
+    db.commit()
 
     return {"blocked": True, "user_id": user_id}
 
 
+@app.delete("/users/{user_id}/block")
 @app.delete("/api/users/{user_id}/block")
 def unblock_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
     existing = db.query(models.BlockedUser).filter(
         models.BlockedUser.blocker_id == current_user.id,
         models.BlockedUser.blocked_id == user_id
@@ -2017,7 +2071,9 @@ def unblock_user(user_id: int, current_user: models.User = Depends(get_current_u
     return {"blocked": False, "user_id": user_id}
 
 
+@app.get("/users/blocked", response_model=List[schemas.UserSearchOut])
 @app.get("/api/users/blocked", response_model=List[schemas.UserSearchOut])
+
 def get_blocked_users(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     blocked_entries = db.query(models.BlockedUser).filter(models.BlockedUser.blocker_id == current_user.id).all()
     b_ids = [b.blocked_id for b in blocked_entries]

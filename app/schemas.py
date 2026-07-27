@@ -454,6 +454,14 @@ class BlockUserRequest(BaseModel):
     user_id: int
 
 
+class BlockStatusOut(BaseModel):
+    is_blocked: bool
+    blocked_by_me: bool
+    blocked_by_them: bool
+    user_id: int
+
+
+
 class UserOnlineStatusOut(BaseModel):
     user_id: int
     is_online: bool

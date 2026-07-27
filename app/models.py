@@ -285,10 +285,15 @@ class BlockedUser(Base):
     blocker = relationship("User", foreign_keys=[blocker_id])
     blocked = relationship("User", foreign_keys=[blocked_id])
 
+    @property
+    def blocked_user_id(self):
+        return self.blocked_id
+
     __table_args__ = (
         UniqueConstraint('blocker_id', 'blocked_id', name='unique_blocker_blocked'),
         CheckConstraint('blocker_id != blocked_id', name='check_cannot_block_self'),
     )
+
 
 
 class UserOnlineStatus(Base):
