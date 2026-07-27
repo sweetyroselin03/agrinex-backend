@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Float, DateTime, Boolean, Text
+from sqlalchemy import Column, Integer, String, ForeignKey, Float, DateTime, Boolean, Text, UniqueConstraint, CheckConstraint
 from sqlalchemy.orm import relationship
 from .database import Base
 from datetime import datetime
@@ -9,18 +9,20 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     phone = Column(String, unique=True, index=True, nullable=True)
-    full_name = Column(String, nullable=True)
+    full_name = Column(String, nullable=True, index=True)
     username = Column(String, unique=True, index=True, nullable=True)
     hashed_password = Column(String, nullable=True)
-    village = Column(String, nullable=True)
+    village = Column(String, nullable=True, index=True)
     district = Column(String, nullable=True)
     state = Column(String, nullable=True)
     farm_size = Column(String, nullable=True)  # Changed to String to support "12.5 Ac"
     experience = Column(String, nullable=True) # Added
-    crop_specialization = Column(String, nullable=True) # Added
+    crop_specialization = Column(String, nullable=True, index=True) # Added
     crop_types = Column(String, nullable=True)
     profile_picture = Column(String, nullable=True)
+    cover_photo = Column(String, nullable=True)
     bio = Column(String, nullable=True)
+    website = Column(String, nullable=True)
     is_verified = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -35,7 +37,7 @@ class User(Base):
 class Post(Base):
     __tablename__ = "posts"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
     content = Column(Text)
     image_url = Column(String, nullable=True)
     hashtags = Column(String, nullable=True)
@@ -54,8 +56,8 @@ class Post(Base):
 class Like(Base):
     __tablename__ = "likes"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
-    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"), index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="likes")
@@ -65,8 +67,8 @@ class Like(Base):
 class Comment(Base):
     __tablename__ = "comments"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
-    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"), index=True)
     content = Column(Text)
     parent_id = Column(Integer, ForeignKey("comments.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -80,8 +82,8 @@ class Comment(Base):
 class SavedPost(Base):
     __tablename__ = "saved_posts"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
-    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"), index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="saved_posts")
@@ -91,12 +93,17 @@ class SavedPost(Base):
 class Follow(Base):
     __tablename__ = "follows"
     id = Column(Integer, primary_key=True, index=True)
-    follower_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
-    following_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    follower_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    following_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     follower = relationship("User", foreign_keys=[follower_id], back_populates="following")
     following = relationship("User", foreign_keys=[following_id], back_populates="followers")
+
+    __table_args__ = (
+        UniqueConstraint('follower_id', 'following_id', name='unique_follower_following'),
+        CheckConstraint('follower_id != following_id', name='check_cannot_follow_self'),
+    )
 
 
 class Notification(Base):

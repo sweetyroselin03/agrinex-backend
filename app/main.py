@@ -81,6 +81,18 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         raise credentials_exception
     return user
 
+def get_optional_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Optional[models.User]:
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, auth_utils.SECRET_KEY, algorithms=[auth_utils.ALGORITHM])
+        email: str = payload.get("sub")
+        if email:
+            return db.query(models.User).filter(models.User.email == email).first()
+    except Exception:
+        pass
+    return None
+
 @app.get("/")
 def read_root():
     return {"message": "AgriNex AI Backend is Live"}
@@ -108,20 +120,40 @@ def get_me(current_user: models.User = Depends(get_current_user), db: Session = 
     return user_out
 
 @app.put("/user/profile", response_model=schemas.UserOut)
+@app.patch("/users/me", response_model=schemas.UserOut)
+@app.put("/users/me", response_model=schemas.UserOut)
+@app.patch("/api/users/me", response_model=schemas.UserOut)
 def update_profile(user_update: schemas.UserUpdate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     for key, value in user_update.dict(exclude_unset=True).items():
         setattr(current_user, key, value)
     db.commit()
     db.refresh(current_user)
     
-    followers_count = db.query(models.Follow).filter(models.Follow.following_id == current_user.id).count()
-    following_count = db.query(models.Follow).filter(models.Follow.follower_id == current_user.id).count()
-    posts_count = db.query(models.Post).filter(models.Post.user_id == current_user.id).count()
+    return prepare_user_out(current_user, current_user.id, db)
+
+def prepare_user_out(user_obj: models.User, current_user_id: Optional[int], db: Session) -> schemas.UserOut:
+    followers_count = db.query(models.Follow).filter(models.Follow.following_id == user_obj.id).count()
+    following_count = db.query(models.Follow).filter(models.Follow.follower_id == user_obj.id).count()
+    posts_count = db.query(models.Post).filter(models.Post.user_id == user_obj.id).count()
     
-    user_out = schemas.UserOut.from_orm(current_user)
+    is_following = False
+    if current_user_id and current_user_id != user_obj.id:
+        is_following = db.query(models.Follow).filter(
+            models.Follow.follower_id == current_user_id,
+            models.Follow.following_id == user_obj.id
+        ).first() is not None
+
+    user_out = schemas.UserOut.from_orm(user_obj)
+    user_out.display_name = user_obj.full_name or f"Farmer {user_obj.id}"
+    user_out.specialization = user_obj.crop_specialization or "Agriculture Specialist"
+    user_out.joined_date = user_obj.created_at
+    user_out.profile_photo = user_obj.profile_picture
+    user_out.cover_photo = user_obj.cover_photo
     user_out.followers_count = followers_count
     user_out.following_count = following_count
     user_out.posts_count = posts_count
+    user_out.is_following = is_following
+    user_out.isFollowing = is_following
     return user_out
 
 @app.delete("/user")
@@ -130,23 +162,133 @@ def delete_account(current_user: models.User = Depends(get_current_user), db: Se
     db.commit()
     return {"message": "Account deleted successfully"}
 
+# ─── Static User Routes (search & suggested MUST be before dynamic {user_id}) ───
+@app.get("/users/search", response_model=List[schemas.UserSearchOut])
+@app.get("/api/users/search", response_model=List[schemas.UserSearchOut])
+@app.get("/social/search", response_model=List[schemas.UserSearchOut])
+def search_users(
+    q: str = Query(..., min_length=1),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db)
+):
+    from sqlalchemy import or_
+    search_term = f"%{q}%"
+    current_id = current_user.id if current_user else None
+
+    query = db.query(models.User).filter(
+        or_(
+            models.User.full_name.ilike(search_term),
+            models.User.username.ilike(search_term),
+            models.User.email.ilike(search_term),
+            models.User.village.ilike(search_term),
+            models.User.district.ilike(search_term),
+        )
+    )
+    if current_id:
+        query = query.filter(models.User.id != current_id)
+
+    users = query.offset(skip).limit(limit).all()
+
+    results = []
+    for u in users:
+        is_following = False
+        if current_id:
+            is_following = db.query(models.Follow).filter(
+                models.Follow.follower_id == current_id,
+                models.Follow.following_id == u.id
+            ).first() is not None
+        
+        followers_cnt = db.query(models.Follow).filter(models.Follow.following_id == u.id).count()
+        following_cnt = db.query(models.Follow).filter(models.Follow.follower_id == u.id).count()
+
+        results.append(schemas.UserSearchOut(
+            id=u.id,
+            full_name=u.full_name,
+            display_name=u.full_name or f"Farmer {u.id}",
+            username=u.username,
+            email=u.email,
+            village=u.village or "Agricultural Hub",
+            profile_picture=u.profile_picture,
+            profile_photo=u.profile_picture,
+            bio=u.bio,
+            verified=u.is_verified,
+            is_verified=u.is_verified,
+            followers=followers_cnt,
+            followers_count=followers_cnt,
+            following_count=following_cnt,
+            is_following=is_following,
+            isFollowing=is_following,
+        ))
+    return results
+
+@app.get("/users/suggested", response_model=List[schemas.UserSearchOut])
+@app.get("/api/users/suggested", response_model=List[schemas.UserSearchOut])
+def get_suggested_users(
+    limit: int = Query(default=5, ge=1, le=20),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    following_ids = [f.following_id for f in db.query(models.Follow.following_id).filter(models.Follow.follower_id == current_user.id).all()]
+    exclude_ids = set(following_ids)
+    exclude_ids.add(current_user.id)
+
+    query = db.query(models.User).filter(~models.User.id.in_(exclude_ids))
+    
+    suggested = []
+    if current_user.crop_specialization or current_user.village:
+        from sqlalchemy import or_
+        matches = query.filter(
+            or_(
+                models.User.crop_specialization == current_user.crop_specialization,
+                models.User.village == current_user.village
+            )
+        ).limit(limit).all()
+        suggested.extend(matches)
+
+    if len(suggested) < limit:
+        already_picked = {u.id for u in suggested}
+        already_picked.update(exclude_ids)
+        remains = db.query(models.User).filter(~models.User.id.in_(already_picked)).limit(limit - len(suggested)).all()
+        suggested.extend(remains)
+
+    res = []
+    for u in suggested:
+        followers_cnt = db.query(models.Follow).filter(models.Follow.following_id == u.id).count()
+        res.append(schemas.UserSearchOut(
+            id=u.id,
+            full_name=u.full_name,
+            display_name=u.full_name or f"Farmer {u.id}",
+            username=u.username,
+            email=u.email,
+            village=u.village or "Agricultural Hub",
+            profile_picture=u.profile_picture,
+            profile_photo=u.profile_picture,
+            bio=u.bio,
+            verified=u.is_verified,
+            is_verified=u.is_verified,
+            followers=followers_cnt,
+            followers_count=followers_cnt,
+            following_count=0,
+            is_following=False,
+            isFollowing=False
+        ))
+    return res
+
+# ─── Dynamic User Routes ───
 @app.get("/users/{user_id}", response_model=schemas.UserOut)
-def get_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.id == user_id).first()
-    if not user:
+@app.get("/api/users/{user_id}", response_model=schemas.UserOut)
+def get_user_profile(user_id: int, current_user: Optional[models.User] = Depends(get_optional_current_user), db: Session = Depends(get_db)):
+    target_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    followers_count = db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
-    following_count = db.query(models.Follow).filter(models.Follow.follower_id == user_id).count()
-    posts_count = db.query(models.Post).filter(models.Post.user_id == user_id).count()
-    
-    user_out = schemas.UserOut.from_orm(user)
-    user_out.followers_count = followers_count
-    user_out.following_count = following_count
-    user_out.posts_count = posts_count
-    return user_out
+    current_id = current_user.id if current_user else None
+    return prepare_user_out(target_user, current_id, db)
 
 @app.post("/users/{user_id}/follow", response_model=schemas.FollowOut)
+@app.post("/api/users/{user_id}/follow", response_model=schemas.FollowOut)
+@app.post("/social/follow/{user_id}", response_model=schemas.FollowOut)
 def follow_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="You cannot follow yourself")
@@ -160,23 +302,58 @@ def follow_user(user_id: int, current_user: models.User = Depends(get_current_us
         models.Follow.following_id == user_id
     ).first()
 
-    if follow:
-        db.delete(follow)
-        db.commit()
-        following = False
-    else:
+    if not follow:
         new_follow = models.Follow(follower_id=current_user.id, following_id=user_id)
         db.add(new_follow)
         db.commit()
-        following = True
-        # Notify the followed user (NOT the follower)
         actor_name = current_user.full_name or f"Farmer {current_user.id}"
-        create_notification(db, user_id, current_user.id, "FOLLOW",
-            f"{actor_name} started following you")
+        create_notification(db, user_id, current_user.id, "FOLLOW", f"{actor_name} started following you")
 
     followers_count = db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
     following_count = db.query(models.Follow).filter(models.Follow.follower_id == current_user.id).count()
-    return schemas.FollowOut(following=following, followers_count=followers_count, following_count=following_count)
+    return schemas.FollowOut(
+        following=True,
+        isFollowing=True,
+        is_following=True,
+        followersCount=followers_count,
+        followers_count=followers_count,
+        followingCount=following_count,
+        following_count=following_count
+    )
+
+@app.delete("/users/{user_id}/follow", response_model=schemas.FollowOut)
+@app.delete("/api/users/{user_id}/follow", response_model=schemas.FollowOut)
+@app.delete("/social/follow/{user_id}", response_model=schemas.FollowOut)
+def unfollow_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot unfollow yourself")
+
+    target_user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    follow = db.query(models.Follow).filter(
+        models.Follow.follower_id == current_user.id,
+        models.Follow.following_id == user_id
+    ).first()
+
+    if follow:
+        db.delete(follow)
+        db.commit()
+        actor_name = current_user.full_name or f"Farmer {current_user.id}"
+        create_notification(db, user_id, current_user.id, "UNFOLLOW", f"{actor_name} unfollowed you")
+
+    followers_count = db.query(models.Follow).filter(models.Follow.following_id == user_id).count()
+    following_count = db.query(models.Follow).filter(models.Follow.follower_id == current_user.id).count()
+    return schemas.FollowOut(
+        following=False,
+        isFollowing=False,
+        is_following=False,
+        followersCount=followers_count,
+        followers_count=followers_count,
+        followingCount=following_count,
+        following_count=following_count
+    )
 
 # ─── Notification Helper ───
 def create_notification(db, user_id: int, actor_id: int, notif_type: str, message: str, post_id: int = None):
@@ -231,10 +408,36 @@ def create_post(post: schemas.PostCreate, current_user: models.User = Depends(ge
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to create post: {str(e)}")
 
+@app.get("/posts/feed", response_model=List[schemas.PostOut])
 @app.get("/posts", response_model=List[schemas.PostOut])
-def get_feed(skip: int = 0, limit: int = 20, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    posts = db.query(models.Post).order_by(models.Post.created_at.desc()).offset(skip).limit(limit).all()
-    return [prepare_post_out(p, current_user.id, db) for p in posts]
+@app.get("/api/posts", response_model=List[schemas.PostOut])
+def get_feed(skip: int = 0, limit: int = 20, current_user: Optional[models.User] = Depends(get_optional_current_user), db: Session = Depends(get_db)):
+    current_id = current_user.id if current_user else None
+    if current_id:
+        following_ids = [f.following_id for f in db.query(models.Follow.following_id).filter(models.Follow.follower_id == current_id).all()]
+        if following_ids:
+            followed_posts = db.query(models.Post).filter(models.Post.user_id.in_(following_ids + [current_id])).order_by(models.Post.created_at.desc()).all()
+            other_posts = db.query(models.Post).filter(~models.Post.user_id.in_(following_ids + [current_id])).order_by(models.Post.created_at.desc()).all()
+            all_posts = followed_posts + other_posts
+            posts = all_posts[skip:skip+limit]
+        else:
+            posts = db.query(models.Post).order_by(models.Post.created_at.desc()).offset(skip).limit(limit).all()
+    else:
+        posts = db.query(models.Post).order_by(models.Post.created_at.desc()).offset(skip).limit(limit).all()
+
+    return [prepare_post_out(p, current_id or 0, db) for p in posts]
+
+@app.get("/posts/user/{user_id}", response_model=List[schemas.PostOut])
+def get_user_posts_by_alias(
+    user_id: int,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, le=100),
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db)
+):
+    current_id = current_user.id if current_user else user_id
+    posts = db.query(models.Post).filter(models.Post.user_id == user_id).order_by(models.Post.created_at.desc()).offset(skip).limit(limit).all()
+    return [prepare_post_out(p, current_id, db) for p in posts]
 
 @app.put("/posts/{post_id}", response_model=schemas.PostOut)
 def update_post(post_id: int, post_update: schemas.PostUpdate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -326,6 +529,15 @@ def like_post(post_id: int, current_user: models.User = Depends(get_current_user
                 f"{actor_name} liked your post", post_id=post_id)
     likes_count = db.query(models.Like).filter(models.Like.post_id == post_id).count()
     return {"liked": liked, "likes_count": likes_count}
+
+@app.delete("/posts/{post_id}/like")
+def unlike_post(post_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    like = db.query(models.Like).filter(models.Like.post_id == post_id, models.Like.user_id == current_user.id).first()
+    if like:
+        db.delete(like)
+        db.commit()
+    likes_count = db.query(models.Like).filter(models.Like.post_id == post_id).count()
+    return {"liked": False, "likes_count": likes_count}
 
 @app.post("/posts/{post_id}/comments", response_model=schemas.CommentOut)
 def comment_post(post_id: int, comment: schemas.CommentCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -437,54 +649,219 @@ def clear_notifications(current_user: models.User = Depends(get_current_user), d
     db.commit()
     return {"message": "All notifications cleared"}
 
-# ─── User Search ───
+# ─── User Search & Social Endpoints ───
 @app.get("/users/search", response_model=List[schemas.UserSearchOut])
+@app.get("/api/users/search", response_model=List[schemas.UserSearchOut])
 def search_users(
     q: str = Query(..., min_length=1),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db)
+):
+    from sqlalchemy import or_
+    search_term = f"%{q}%"
+    current_id = current_user.id if current_user else None
+
+    query = db.query(models.User).filter(
+        or_(
+            models.User.full_name.ilike(search_term),
+            models.User.username.ilike(search_term),
+            models.User.email.ilike(search_term),
+            models.User.village.ilike(search_term),
+        )
+    )
+    if current_id:
+        query = query.filter(models.User.id != current_id)
+
+    users = query.offset(skip).limit(limit).all()
+
+    results = []
+    for u in users:
+        is_following = False
+        if current_id:
+            is_following = db.query(models.Follow).filter(
+                models.Follow.follower_id == current_id,
+                models.Follow.following_id == u.id
+            ).first() is not None
+        
+        followers_cnt = db.query(models.Follow).filter(models.Follow.following_id == u.id).count()
+        following_cnt = db.query(models.Follow).filter(models.Follow.follower_id == u.id).count()
+
+        results.append(schemas.UserSearchOut(
+            id=u.id,
+            full_name=u.full_name,
+            display_name=u.full_name or f"Farmer {u.id}",
+            username=u.username,
+            email=u.email,
+            village=u.village or "Agricultural Hub",
+            profile_picture=u.profile_picture,
+            profile_photo=u.profile_picture,
+            bio=u.bio,
+            verified=u.is_verified,
+            is_verified=u.is_verified,
+            followers=followers_cnt,
+            followers_count=followers_cnt,
+            following_count=following_cnt,
+            is_following=is_following,
+            isFollowing=is_following,
+        ))
+    return results
+
+@app.get("/users/suggested", response_model=List[schemas.UserSearchOut])
+@app.get("/api/users/suggested", response_model=List[schemas.UserSearchOut])
+def get_suggested_users(
+    limit: int = Query(default=5, ge=1, le=20),
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    from sqlalchemy import or_, func
-    search = f"%{q}%"
-    users = db.query(models.User).filter(
-        models.User.id != current_user.id,
-        or_(
-            models.User.full_name.ilike(search),
-            models.User.email.ilike(search),
-            models.User.username.ilike(search),
-        )
-    ).limit(20).all()
+    following_ids = [f.following_id for f in db.query(models.Follow.following_id).filter(models.Follow.follower_id == current_user.id).all()]
+    exclude_ids = set(following_ids)
+    exclude_ids.add(current_user.id)
 
-    result = []
-    for u in users:
-        is_following = db.query(models.Follow).filter(
-            models.Follow.follower_id == current_user.id,
-            models.Follow.following_id == u.id
-        ).first() is not None
-        followers_count = db.query(models.Follow).filter(models.Follow.following_id == u.id).count()
-        following_count = db.query(models.Follow).filter(models.Follow.follower_id == u.id).count()
-        out = schemas.UserSearchOut(
+    query = db.query(models.User).filter(~models.User.id.in_(exclude_ids))
+    
+    suggested = []
+    if current_user.crop_specialization or current_user.village:
+        from sqlalchemy import or_
+        matches = query.filter(
+            or_(
+                models.User.crop_specialization == current_user.crop_specialization,
+                models.User.village == current_user.village
+            )
+        ).limit(limit).all()
+        suggested.extend(matches)
+
+    if len(suggested) < limit:
+        already_picked = {u.id for u in suggested}
+        already_picked.update(exclude_ids)
+        remains = db.query(models.User).filter(~models.User.id.in_(already_picked)).limit(limit - len(suggested)).all()
+        suggested.extend(remains)
+
+    res = []
+    for u in suggested:
+        followers_cnt = db.query(models.Follow).filter(models.Follow.following_id == u.id).count()
+        res.append(schemas.UserSearchOut(
             id=u.id,
             full_name=u.full_name,
+            display_name=u.full_name or f"Farmer {u.id}",
             username=u.username,
             email=u.email,
+            village=u.village or "Agricultural Hub",
             profile_picture=u.profile_picture,
+            profile_photo=u.profile_picture,
             bio=u.bio,
+            verified=u.is_verified,
             is_verified=u.is_verified,
+            followers=followers_cnt,
+            followers_count=followers_cnt,
+            following_count=0,
+            is_following=False,
+            isFollowing=False
+        ))
+    return res
+
+@app.get("/users/{user_id}/posts", response_model=List[schemas.PostOut])
+@app.get("/api/users/{user_id}/posts", response_model=List[schemas.PostOut])
+def get_user_posts(
+    user_id: int,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=20, le=100),
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db)
+):
+    current_id = current_user.id if current_user else user_id
+    posts = db.query(models.Post).filter(models.Post.user_id == user_id).order_by(models.Post.created_at.desc()).offset(skip).limit(limit).all()
+    return [prepare_post_out(p, current_id, db) for p in posts]
+
+@app.get("/users/{user_id}/followers", response_model=List[schemas.UserSearchOut])
+@app.get("/api/users/{user_id}/followers", response_model=List[schemas.UserSearchOut])
+def get_user_followers(
+    user_id: int,
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db)
+):
+    current_id = current_user.id if current_user else None
+    follows = db.query(models.Follow).filter(models.Follow.following_id == user_id).all()
+    follower_users = [f.follower for f in follows if f.follower]
+
+    res = []
+    for u in follower_users:
+        is_following = False
+        if current_id:
+            is_following = db.query(models.Follow).filter(
+                models.Follow.follower_id == current_id,
+                models.Follow.following_id == u.id
+            ).first() is not None
+        f_cnt = db.query(models.Follow).filter(models.Follow.following_id == u.id).count()
+        res.append(schemas.UserSearchOut(
+            id=u.id,
+            full_name=u.full_name,
+            display_name=u.full_name or f"Farmer {u.id}",
+            username=u.username,
+            email=u.email,
+            village=u.village or "Agricultural Hub",
+            profile_picture=u.profile_picture,
+            profile_photo=u.profile_picture,
+            bio=u.bio,
+            verified=u.is_verified,
+            is_verified=u.is_verified,
+            followers=f_cnt,
+            followers_count=f_cnt,
+            following_count=0,
             is_following=is_following,
-            followers_count=followers_count,
-            following_count=following_count,
-        )
-        result.append(out)
-    return result
+            isFollowing=is_following
+        ))
+    return res
+
+@app.get("/users/{user_id}/following", response_model=List[schemas.UserSearchOut])
+@app.get("/api/users/{user_id}/following", response_model=List[schemas.UserSearchOut])
+def get_user_following(
+    user_id: int,
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db)
+):
+    current_id = current_user.id if current_user else None
+    follows = db.query(models.Follow).filter(models.Follow.follower_id == user_id).all()
+    following_users = [f.following for f in follows if f.following]
+
+    res = []
+    for u in following_users:
+        is_following = False
+        if current_id:
+            is_following = db.query(models.Follow).filter(
+                models.Follow.follower_id == current_id,
+                models.Follow.following_id == u.id
+            ).first() is not None
+        f_cnt = db.query(models.Follow).filter(models.Follow.following_id == u.id).count()
+        res.append(schemas.UserSearchOut(
+            id=u.id,
+            full_name=u.full_name,
+            display_name=u.full_name or f"Farmer {u.id}",
+            username=u.username,
+            email=u.email,
+            village=u.village or "Agricultural Hub",
+            profile_picture=u.profile_picture,
+            profile_photo=u.profile_picture,
+            bio=u.bio,
+            verified=u.is_verified,
+            is_verified=u.is_verified,
+            followers=f_cnt,
+            followers_count=f_cnt,
+            following_count=0,
+            is_following=is_following,
+            isFollowing=is_following
+        ))
+    return res
 
 @app.get("/users/{user_id}/is-following")
+@app.get("/api/users/{user_id}/is-following")
 def is_following_user(user_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     following = db.query(models.Follow).filter(
         models.Follow.follower_id == current_user.id,
         models.Follow.following_id == user_id
     ).first() is not None
-    return {"is_following": following}
+    return {"is_following": following, "isFollowing": following}
 
 # ─── Chat AI ───
 @app.post("/ai/chat", response_model=schemas.ChatMessage)

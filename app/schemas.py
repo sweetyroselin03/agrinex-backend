@@ -15,6 +15,7 @@ class UserCreate(UserBase):
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     username: Optional[str] = None
+    phone: Optional[str] = None
     village: Optional[str] = None
     district: Optional[str] = None
     state: Optional[str] = None
@@ -23,13 +24,16 @@ class UserUpdate(BaseModel):
     crop_specialization: Optional[str] = None
     crop_types: Optional[str] = None
     profile_picture: Optional[str] = None
+    cover_photo: Optional[str] = None
     bio: Optional[str] = None
+    website: Optional[str] = None
 
 class UserOut(BaseModel):
     id: int
     email: str
     phone: Optional[str] = None
     full_name: Optional[str] = None
+    display_name: Optional[str] = None
     username: Optional[str] = None
     village: Optional[str] = None
     district: Optional[str] = None
@@ -37,13 +41,21 @@ class UserOut(BaseModel):
     farm_size: Optional[str] = None
     experience: Optional[str] = None
     crop_specialization: Optional[str] = None
+    specialization: Optional[str] = None
     crop_types: Optional[str] = None
     profile_picture: Optional[str] = None
+    profile_photo: Optional[str] = None
+    cover_photo: Optional[str] = None
     bio: Optional[str] = None
+    website: Optional[str] = None
     is_verified: Optional[bool] = False
+    created_at: Optional[datetime] = None
+    joined_date: Optional[datetime] = None
     followers_count: Optional[int] = 0
     following_count: Optional[int] = 0
     posts_count: Optional[int] = 0
+    is_following: Optional[bool] = False
+    isFollowing: Optional[bool] = False
 
     class Config:
         from_attributes = True
@@ -55,14 +67,20 @@ User = UserOut
 class UserSearchOut(BaseModel):
     id: int
     full_name: Optional[str] = None
+    display_name: Optional[str] = None
     username: Optional[str] = None
     email: str
+    village: Optional[str] = None
     profile_picture: Optional[str] = None
+    profile_photo: Optional[str] = None
     bio: Optional[str] = None
-    is_verified: Optional[bool] = False
-    is_following: bool = False
-    followers_count: int = 0
-    following_count: int = 0
+    verified: Optional[bool] = True
+    is_verified: Optional[bool] = True
+    followers: Optional[int] = 0
+    followers_count: Optional[int] = 0
+    following_count: Optional[int] = 0
+    is_following: Optional[bool] = False
+    isFollowing: Optional[bool] = False
 
     class Config:
         from_attributes = True
@@ -206,8 +224,15 @@ CommentOut.model_rebuild()
 # ─── Follow ───────────────────────────────────────────────────────────────────
 class FollowOut(BaseModel):
     following: bool
+    isFollowing: bool
+    is_following: bool
+    followersCount: int
     followers_count: int
-    following_count: Optional[int] = 0
+    followingCount: int
+    following_count: int
+
+    class Config:
+        from_attributes = True
 
 
 # ─── Notification ─────────────────────────────────────────────────────────────

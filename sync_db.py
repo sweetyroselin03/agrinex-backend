@@ -10,65 +10,60 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 
 engine = create_engine(DATABASE_URL)
 
+def add_column_if_missing(conn, table: str, column: str, col_type: str):
+    try:
+        conn.execute(text(f"SELECT {column} FROM {table} LIMIT 1;"))
+        print(f"DONE: '{column}' column already exists in '{table}' table.")
+    except Exception:
+        conn.rollback()
+        try:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type};"))
+            conn.commit()
+            print(f"DONE: Added '{column}' column to '{table}' table.")
+        except Exception as e:
+            conn.rollback()
+            print(f"INFO: Could not add column '{column}' to '{table}': {e}")
+
 def sync_db():
     print("Syncing Database Schema...")
     
     with engine.connect() as conn:
-        # Add missing columns to users table
+        add_column_if_missing(conn, "users", "username", "VARCHAR")
+        add_column_if_missing(conn, "users", "experience", "VARCHAR")
+        add_column_if_missing(conn, "users", "crop_specialization", "VARCHAR")
+        add_column_if_missing(conn, "users", "cover_photo", "VARCHAR")
+        add_column_if_missing(conn, "users", "website", "VARCHAR")
+        add_column_if_missing(conn, "chat_messages", "conversation_id", "VARCHAR")
+        add_column_if_missing(conn, "posts", "images", "TEXT")
+
         try:
-            print("Checking 'username' column...")
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR;"))
+            print("Cleaning duplicate follows before enforcing unique constraint...")
+            conn.execute(text("""
+                DELETE FROM follows
+                WHERE id NOT IN (
+                    SELECT MIN(id)
+                    FROM follows
+                    GROUP BY follower_id, following_id
+                );
+            """))
             conn.commit()
-            print("DONE: 'username' column synced.")
+            print("DONE: Duplicate follows cleaned.")
         except Exception as e:
-            print(f"ERROR: Could not add 'username': {e}")
+            conn.rollback()
+            print(f"INFO: Skip duplicate follow cleanup: {e}")
 
         try:
-            print("Checking 'experience' column...")
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS experience VARCHAR;"))
+            print("Creating unique index on follows (follower_id, following_id)...")
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS unique_follower_following ON follows (follower_id, following_id);"))
             conn.commit()
-            print("DONE: 'experience' column synced.")
+            print("DONE: Unique index on follows created.")
         except Exception as e:
-            print(f"ERROR: Could not add 'experience': {e}")
+            conn.rollback()
+            print(f"INFO: Unique index creation: {e}")
 
-        try:
-            print("Checking 'crop_specialization' column...")
-            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS crop_specialization VARCHAR;"))
-            conn.commit()
-            print("DONE: 'crop_specialization' column synced.")
-        except Exception as e:
-            print(f"ERROR: Could not add 'crop_specialization': {e}")
-
-        try:
-            print("Updating 'farm_size' column type...")
-            # We use USING to cast float to varchar
-            conn.execute(text("ALTER TABLE users ALTER COLUMN farm_size TYPE VARCHAR USING farm_size::text;"))
-            conn.commit()
-            print("DONE: 'farm_size' type updated to VARCHAR.")
-        except Exception as e:
-            print(f"ERROR: Could not update 'farm_size' type: {e}")
-
-        try:
-            print("Checking 'conversation_id' column in 'chat_messages'...")
-            conn.execute(text("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS conversation_id VARCHAR;"))
-            conn.commit()
-            print("DONE: 'conversation_id' column synced.")
-        except Exception as e:
-            print(f"ERROR: Could not add 'conversation_id': {e}")
-
-        try:
-            print("Checking 'images' column in 'posts'...")
-            try:
-                conn.execute(text("SELECT images FROM posts LIMIT 1;"))
-                print("DONE: 'images' column already exists in 'posts' table.")
-            except Exception:
-                conn.rollback()
-                conn.execute(text("ALTER TABLE posts ADD COLUMN images TEXT;"))
-                conn.commit()
-                print("DONE: Added 'images' column to 'posts' table.")
-        except Exception as e:
-            print(f"ERROR: Could not add 'images' column to 'posts' table: {e}")
-
+    # Ensure all tables created via metadata
+    from app.models import Base
+    Base.metadata.create_all(bind=engine)
     print("\nDatabase sync completed successfully!")
 
 if __name__ == "__main__":
