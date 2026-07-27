@@ -138,16 +138,48 @@ def get_me(current_user: models.User = Depends(get_current_user), db: Session = 
     return user_out
 
 @app.put("/user/profile", response_model=schemas.UserOut)
-@app.patch("/users/me", response_model=schemas.UserOut)
+@app.patch("/user/profile", response_model=schemas.UserOut)
+@app.put("/api/user/profile", response_model=schemas.UserOut)
+@app.patch("/api/user/profile", response_model=schemas.UserOut)
+@app.put("/users/profile", response_model=schemas.UserOut)
+@app.patch("/users/profile", response_model=schemas.UserOut)
+@app.put("/api/users/profile", response_model=schemas.UserOut)
+@app.patch("/api/users/profile", response_model=schemas.UserOut)
 @app.put("/users/me", response_model=schemas.UserOut)
+@app.patch("/users/me", response_model=schemas.UserOut)
+@app.put("/api/users/me", response_model=schemas.UserOut)
 @app.patch("/api/users/me", response_model=schemas.UserOut)
 def update_profile(user_update: schemas.UserUpdate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Username uniqueness validation
+    if user_update.username:
+        clean_username = user_update.username.strip().lstrip('@')
+        if clean_username:
+            existing = db.query(models.User).filter(
+                models.User.username.ilike(clean_username),
+                models.User.id != current_user.id
+            ).first()
+            if existing:
+                raise HTTPException(status_code=400, detail="Username already exists. Please choose a different username.")
+            user_update.username = clean_username
+
+    if user_update.bio and len(user_update.bio.strip()) > 250:
+        raise HTTPException(status_code=400, detail="Bio cannot exceed 250 characters.")
+
     for key, value in user_update.dict(exclude_unset=True).items():
+        if value is not None and isinstance(value, str):
+            value = value.strip()
         setattr(current_user, key, value)
-    db.commit()
-    db.refresh(current_user)
+
+    try:
+        db.commit()
+        db.refresh(current_user)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[Profile Update Error] {e}")
+        raise HTTPException(status_code=500, detail="Database update failed. Please try again.")
     
     return prepare_user_out(current_user, current_user.id, db)
+
 
 def prepare_user_out(user_obj: models.User, current_user_id: Optional[int], db: Session) -> schemas.UserOut:
     followers_count = db.query(models.Follow).filter(models.Follow.following_id == user_obj.id).count()
