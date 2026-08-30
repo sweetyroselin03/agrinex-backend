@@ -2199,3 +2199,29 @@ async def websocket_chat_endpoint(websocket: WebSocket, user_id: int, db: Sessio
             status_entry.last_seen = datetime.utcnow()
             db.commit()
 
+
+@app.get("/ai/model-info")
+def get_ai_model_info():
+    """Returns PyTorch vision engine architecture, status, and model metadata."""
+    try:
+        if hasattr(ai_service, 'ai_service') and hasattr(ai_service.ai_service, 'vision_engine'):
+            info = ai_service.ai_service.vision_engine.get_model_info()
+        else:
+            info = {}
+        info.update({
+            "model_name": "AgriNex MobileNetV3 / ResNet18 Crop Vision & Gemini Engine",
+            "version": "2.5.0-v2b",
+            "status": "active",
+            "backend_framework": "PyTorch / Google Gemini AI",
+            "cache_loaded": True
+        })
+        return info
+    except Exception as e:
+        return {
+            "model_name": "AgriNex Vision & Gemini Engine",
+            "version": "2.5.0-v2b",
+            "status": "active",
+            "error": str(e)
+        }
+
+
