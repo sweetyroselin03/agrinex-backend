@@ -1,7 +1,7 @@
 """
 AgriNex Local PyTorch ML Vision Engine (V2-B ResNet18 Model - 60 Classes)
 
-Safe, lazy-loading inference engine for AgriNex trained ML disease classification model.
+Safe, non-blocking lazy-loading inference engine for AgriNex trained ML disease classification model.
 Supports automatic Git LFS model downloading if deploying in environments without pre-extracted LFS assets.
 """
 
@@ -10,19 +10,23 @@ import io
 import json
 import base64
 import logging
-import subprocess
 import urllib.request
 from pathlib import Path
 from typing import Dict, Any, Union
 
-import torch
-import torch.nn as nn
-from torchvision import transforms, models
-from PIL import Image, ImageFile
-
-ImageFile.LOAD_TRUNCATED_IMAGES = True
-
 logger = logging.getLogger("uvicorn.error")
+
+try:
+    import torch
+    import torch.nn as nn
+    from torchvision import transforms, models
+    from PIL import Image, ImageFile
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    TORCH_AVAILABLE = True
+    TORCH_IMPORT_ERROR = None
+except Exception as torch_err:
+    TORCH_AVAILABLE = False
+    TORCH_IMPORT_ERROR = str(torch_err)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL_PATH = os.getenv(
@@ -34,8 +38,10 @@ DEFAULT_DB_PATH = str(BASE_DIR / "ai_model_training" / "disease_info.json")
 LFS_DOWNLOAD_URL = "https://media.githubusercontent.com/media/sweetyroselin03/agrinex-backend/main/ai_model_training/agrinex_disease_model_v2b_best.pth"
 
 
-def get_inference_transforms(image_size: int = 224) -> transforms.Compose:
+def get_inference_transforms(image_size: int = 224):
     """Exact validation/test image transformation pipeline matching V2-B model training."""
+    if not TORCH_AVAILABLE:
+        return None
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
@@ -49,7 +55,7 @@ class PyTorchVisionEngine:
     def __init__(self, model_path: str = None, db_path: str = None):
         self.model_path = Path(model_path or DEFAULT_MODEL_PATH)
         self.db_path = Path(db_path or DEFAULT_DB_PATH)
-        self.device = torch.device("cpu")
+        self.device = torch.device("cpu") if TORCH_AVAILABLE else "cpu"
         self.model = None
         self.class_names = []
         self.num_classes = 0
@@ -57,13 +63,12 @@ class PyTorchVisionEngine:
         self.is_loaded = False
         self.load_error = None
         self.is_loading = False
-        self.transform = get_inference_transforms(224)
+        self.transform = get_inference_transforms(224) if TORCH_AVAILABLE else None
 
     def _ensure_real_model_file(self):
         """Validates model file existence and resolves Git LFS pointer files automatically."""
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Check if file exists
         if not self.model_path.exists():
             logger.warning(f"[AgriNex ML] Model file missing at {self.model_path}. Attempting LFS download...")
             self._download_lfs_model()
@@ -98,6 +103,11 @@ class PyTorchVisionEngine:
 
     def load_model(self):
         """Safely loads and validates the trained ResNet18 V2-B model in CPU memory."""
+        if not TORCH_AVAILABLE:
+            self.load_error = f"PyTorch dependencies not installed: {TORCH_IMPORT_ERROR}"
+            logger.error(f"[AgriNex ML Error] {self.load_error}")
+            return
+
         if self.is_loaded:
             return
 
@@ -152,17 +162,19 @@ class PyTorchVisionEngine:
             # REQUIRED STARTUP LOGS
             logger.info("[AgriNex ML] Model loaded successfully")
             logger.info(f"[AgriNex ML] Classes: {self.num_classes}")
-            logger.info(f"[AgriNex ML] Device: {self.device.type}")
+            logger.info(f"[AgriNex ML] Device: cpu")
 
         except Exception as e:
             self.is_loaded = False
             self.is_loading = False
             self.load_error = str(e)
             logger.error(f"[AgriNex ML Error] Failed to load PyTorch model: {e}")
-            raise e
 
-    def _prepare_image(self, image_input: Union[str, bytes, Image.Image]) -> Image.Image:
+    def _prepare_image(self, image_input: Union[str, bytes, Any]) -> Any:
         """Decodes image input (base64 string, bytes, file path, PIL Image) to RGB PIL Image."""
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PIL / PyTorch libraries are missing.")
+
         if isinstance(image_input, Image.Image):
             return image_input.convert("RGB")
 
@@ -187,7 +199,7 @@ class PyTorchVisionEngine:
 
         raise ValueError("Invalid image input format. Expected base64 string, bytes, or valid file path.")
 
-    def predict(self, image_input: Union[str, bytes, Image.Image]) -> Dict[str, Any]:
+    def predict(self, image_input: Union[str, bytes, Any]) -> Dict[str, Any]:
         """Runs local PyTorch ResNet18 disease classification and enriches with knowledge database."""
         if not self.is_loaded:
             self.load_model()
