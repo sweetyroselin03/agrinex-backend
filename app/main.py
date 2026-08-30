@@ -1057,84 +1057,17 @@ def get_conversations(current_user: models.User = Depends(get_current_user), db:
     
     return results
 
-# ─── Crop Scan (Two-Stage Validation Pipeline) ───
+# ─── Crop Scan (Trained PyTorch ML Engine) ───
 @app.post("/ai/detect-disease", response_model=schemas.CropScanOut)
 async def create_scan(scan: schemas.CropScanCreate, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    
-    # ━━━ STAGE 1: Validate that the image contains a crop/plant ━━━
-    validation = await ai_service.ai_service.validate_crop_image(scan.image_url)
-    
-    if not validation.get("is_valid", True):
-        # Image rejected — return immediately without running disease detection
-        detected = validation.get("detected_object", "non-agricultural object")
-        reason = validation.get("rejection_reason", "This image does not contain a detectable crop or plant.")
-        quality_issue = validation.get("quality_issue")
-        
-        disease_name = "Quality Issue" if quality_issue else "Invalid Crop Scan"
-        
-        return schemas.CropScanOut(
-            id=-1,
-            user_id=current_user.id,
-            image_url=scan.image_url,
-            disease_name=disease_name,
-            confidence=validation.get("confidence", 0.0),
-            is_valid_crop=False,
-            severity_level="Critical",
-            symptoms=reason,
-            causes=f"Detected: {detected}. {reason}",
-            prevention="Align a plant leaf, fruit, or stem in the camera frame for accurate disease detection.",
-            detected_object=detected,
-            rejection_reason=reason,
-            created_at=datetime.utcnow()
-        )
-    
-    # ━━━ STAGE 2: Run disease detection (only for validated crop images) ━━━
+    # Run inference directly using trained PyTorch ResNet18 model
     analysis = await ai_service.ai_service.detect_disease(scan.image_url)
-    
-    if not analysis:
-        analysis = {
-            "is_valid_crop": True,
-            "disease_name": "Analysis Unavailable",
-            "confidence_level": 0.0,
-            "severity_level": "Warning",
-            "symptoms": "AI service temporarily unavailable",
-            "causes": "Server connectivity issue",
-            "prevention": "Please try again in a moment",
-            "treatment": "Retry scan or consult local agriculture expert",
-            "organic_treatment": "Consult local expert",
-            "pesticide_recommendations": "Consult local dealer",
-            "irrigation_recommendations": "Maintain regular schedule",
-            "fertilizer_recommendations": "Balanced NPK",
-            "recovery_steps": "Retry scan when service is available",
-            "estimated_recovery_time": "N/A",
-            "weather_risk": "N/A",
-            "prevention_tips": "Regular monitoring recommended",
-        }
 
-    # Confidence check
-    confidence = analysis.get("confidence_level", 0.0)
-    if confidence < 65.0:
-        return schemas.CropScanOut(
-            id=-1,
-            user_id=current_user.id,
-            image_url=scan.image_url,
-            disease_name="Quality Issue",
-            confidence=confidence,
-            is_valid_crop=False,
-            severity_level="Critical",
-            symptoms="Unable to confidently identify disease. Please retake image in good lighting.",
-            causes="Low confidence match.",
-            prevention="Make sure the leaf is in focus and there is adequate lighting.",
-            detected_object=analysis.get("crop_type", "crop"),
-            rejection_reason="Unable to confidently identify disease.",
-            created_at=datetime.utcnow()
-        )
-    
     db_scan = models.CropScan(
         user_id=current_user.id,
         image_url=scan.image_url,
         disease_name=analysis.get("disease_name", "Unknown"),
-        confidence=analysis.get("confidence_level", 0.0),
+        confidence=analysis.get("confidence", 0.0),
         symptoms=analysis.get("symptoms"),
         causes=analysis.get("causes"),
         prevention=analysis.get("prevention"),
@@ -1150,14 +1083,13 @@ async def create_scan(scan: schemas.CropScanCreate, current_user: models.User = 
         pro_tips=analysis.get("pro_tips"),
         prevention_tips=analysis.get("prevention_tips"),
         is_valid_crop=True,
-        detected_object=analysis.get("crop_type", "Unknown"),
+        detected_object=analysis.get("detected_object", "Crop"),
         rejection_reason=""
     )
     db.add(db_scan)
     db.commit()
     db.refresh(db_scan)
-    
-    # Return with extra fields from analysis
+
     result = schemas.CropScanOut.from_orm(db_scan)
     return result
 
@@ -2202,26 +2134,22 @@ async def websocket_chat_endpoint(websocket: WebSocket, user_id: int, db: Sessio
 
 @app.get("/ai/model-info")
 def get_ai_model_info():
-    """Returns PyTorch vision engine architecture, status, and model metadata."""
-    try:
-        if hasattr(ai_service, 'ai_service') and hasattr(ai_service.ai_service, 'vision_engine'):
-            info = ai_service.ai_service.vision_engine.get_model_info()
-        else:
-            info = {}
-        info.update({
-            "model_name": "AgriNex MobileNetV3 / ResNet18 Crop Vision & Gemini Engine",
-            "version": "2.5.0-v2b",
-            "status": "active",
-            "backend_framework": "PyTorch / Google Gemini AI",
-            "cache_loaded": True
-        })
-        return info
-    except Exception as e:
-        return {
-            "model_name": "AgriNex Vision & Gemini Engine",
-            "version": "2.5.0-v2b",
-            "status": "active",
-            "error": str(e)
+    """Returns status and provider configuration of AgriNex AI services."""
+    llama_model = os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile")
+    return {
+        "Disease Scanner": {
+            "provider": "custom_ml",
+            "model": "agrinex_disease_model_v2b_best (ResNet18 V2-B 60-Class)",
+            "status": "loaded"
+        },
+        "AI Chat": {
+            "provider": "groq",
+            "model": llama_model,
+            "status": "configured"
+        },
+        "Gemini": {
+            "status": "disabled"
         }
+    }
 
 
