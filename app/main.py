@@ -2134,20 +2134,26 @@ async def websocket_chat_endpoint(websocket: WebSocket, user_id: int, db: Sessio
 
 @app.get("/ai/model-info")
 def get_ai_model_info():
-    """Returns status and provider configuration of AgriNex AI services."""
+    """Returns runtime status and provider configuration of AgriNex AI services."""
+    from .pytorch_vision_engine import vision_engine
     llama_model = os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile")
+    scanner_status = "loaded" if vision_engine.is_loaded else ("error" if vision_engine.load_error else "unloaded")
+    groq_status = "configured" if os.getenv("GROQ_API_KEY") or ai_service.ai_service.client else "unconfigured"
+
     return {
-        "Disease Scanner": {
+        "disease_scanner": {
             "provider": "custom_ml",
-            "model": "agrinex_disease_model_v2b_best (ResNet18 V2-B 60-Class)",
-            "status": "loaded"
+            "model": "ResNet18 V2-B",
+            "classes": 60,
+            "status": scanner_status
         },
-        "AI Chat": {
+        "ai_chat": {
             "provider": "groq",
             "model": llama_model,
-            "status": "configured"
+            "status": groq_status
         },
-        "Gemini": {
+        "gemini": {
+            "provider": "gemini",
             "status": "disabled"
         }
     }

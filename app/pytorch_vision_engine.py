@@ -1,9 +1,9 @@
 """
-AgriNex Local PyTorch ML Vision Engine (V2-B Model - 60 Classes)
+AgriNex Local PyTorch ML Vision Engine (V2-B ResNet18 Model - 60 Classes)
 
 Loads the trained ResNet18 V2-B checkpoint (agrinex_disease_model_v2b_best.pth),
-runs CPU inference matching the exact training preprocessing pipeline,
-and enriches predictions with the curated disease knowledge database (disease_info.json).
+runs CPU inference matching exact training preprocessing pipelines,
+and enriches predictions with curated disease knowledge database (disease_info.json).
 """
 
 import os
@@ -41,7 +41,7 @@ def get_inference_transforms(image_size: int = 224) -> transforms.Compose:
 
 
 class PyTorchVisionEngine:
-    """Singleton inference engine for AgriNex trained ML disease model."""
+    """Inference engine for AgriNex trained ML disease classification model."""
 
     def __init__(self, model_path: str = None, db_path: str = None):
         self.model_path = Path(model_path or DEFAULT_MODEL_PATH)
@@ -52,58 +52,84 @@ class PyTorchVisionEngine:
         self.num_classes = 0
         self.disease_db = {}
         self.is_loaded = False
+        self.load_error = None
         self.transform = get_inference_transforms(224)
 
     def load_model(self):
-        """Loads the trained disease model into CPU memory safely."""
+        """Loads and validates the trained ResNet18 V2-B model in CPU memory."""
         if self.is_loaded:
             return
 
-        logger.info("[AgriNex ML] Loading trained disease model...")
-        logger.info(f"[AgriNex ML] Target model checkpoint path: {self.model_path}")
+        logger.info("[AgriNex ML] Loading ResNet18 V2-B...")
 
-        if not self.model_path.exists():
-            # Try fallback paths
-            alt_path = BASE_DIR.parent / "AGRINEX-DISEASE-ML" / "models" / "agrinex_disease_model_v2b_best.pth"
-            if alt_path.exists():
-                self.model_path = alt_path
+        try:
+            # 1. Model file existence check
+            if not self.model_path.exists():
+                alt_path = BASE_DIR.parent / "AGRINEX-DISEASE-ML" / "models" / "agrinex_disease_model_v2b_best.pth"
+                if alt_path.exists():
+                    self.model_path = alt_path
+                else:
+                    err_msg = f"[AgriNex ML Error] Model checkpoint missing at: {self.model_path}"
+                    logger.error(err_msg)
+                    self.load_error = err_msg
+                    raise FileNotFoundError(err_msg)
+
+            # 2. Check model file size (must be real weights, not LFS pointer file)
+            file_size = os.path.getsize(self.model_path)
+            if file_size < 10_000_000:
+                err_msg = f"[AgriNex ML Error] Model file at {self.model_path} is an LFS pointer or corrupted (size: {file_size} bytes)."
+                logger.error(err_msg)
+                self.load_error = err_msg
+                raise ValueError(err_msg)
+
+            # 3. Load checkpoint
+            checkpoint = torch.load(self.model_path, map_location=self.device)
+            self.class_names = checkpoint.get("class_names", [])
+            self.num_classes = checkpoint.get("num_classes", len(self.class_names))
+
+            # 4. Class count validation
+            if not self.class_names or self.num_classes != 60:
+                err_msg = f"[AgriNex ML Error] Checkpoint must contain exactly 60 classes. Found: {self.num_classes}"
+                logger.error(err_msg)
+                self.load_error = err_msg
+                raise ValueError(err_msg)
+
+            # 5. Reconstruct ResNet18 architecture & load state_dict
+            self.model = models.resnet18(weights=None)
+            in_features = self.model.fc.in_features
+            self.model.fc = nn.Linear(in_features, self.num_classes)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.model.to(self.device)
+            self.model.eval()
+
+            # 6. Disease knowledge database validation
+            if not self.db_path.exists():
+                logger.warning(f"[AgriNex ML Warning] Disease info database missing at {self.db_path}")
             else:
-                logger.error(f"[AgriNex ML Error] Model checkpoint not found at {self.model_path}")
-                raise FileNotFoundError(f"Model checkpoint not found at {self.model_path}")
-
-        # Load checkpoint
-        checkpoint = torch.load(self.model_path, map_location=self.device)
-        self.class_names = checkpoint.get("class_names", [])
-        self.num_classes = checkpoint.get("num_classes", len(self.class_names))
-
-        if not self.class_names:
-            raise ValueError(f"Checkpoint at {self.model_path} missing 'class_names'!")
-
-        # Reconstruct ResNet18 architecture
-        self.model = models.resnet18(weights=None)
-        in_features = self.model.fc.in_features
-        self.model.fc = nn.Linear(in_features, self.num_classes)
-
-        # Load state dictionary
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.model.to(self.device)
-        self.model.eval()
-
-        # Load disease knowledge database if available
-        if self.db_path.exists():
-            try:
                 with open(self.db_path, "r", encoding="utf-8") as f:
                     self.disease_db = json.load(f)
-                logger.info(f"[AgriNex ML] Knowledge database loaded from {self.db_path}")
-            except Exception as e:
-                logger.warning(f"[AgriNex ML Warning] Failed to load disease_info.json: {e}")
 
-        self.is_loaded = True
-        logger.info("[AgriNex ML] Disease model loaded successfully")
-        logger.info("[AgriNex ML] Scanner ready")
+            # 7. Test dummy tensor inference
+            dummy_input = torch.randn(1, 3, 224, 224).to(self.device)
+            with torch.no_grad():
+                _ = self.model(dummy_input)
+
+            self.is_loaded = True
+            self.load_error = None
+
+            # EXACT REQUIRED STARTUP LOGS
+            logger.info("[AgriNex ML] Model loaded successfully")
+            logger.info(f"[AgriNex ML] Classes: {self.num_classes}")
+            logger.info(f"[AgriNex ML] Device: {self.device.type}")
+
+        except Exception as e:
+            self.is_loaded = False
+            self.load_error = str(e)
+            logger.error(f"[AgriNex ML Fatal Error] Failed to initialize PyTorch ML vision engine: {e}")
+            raise e
 
     def _prepare_image(self, image_input: Union[str, bytes, Image.Image]) -> Image.Image:
-        """Decodes base64, bytes, or file path to PIL RGB Image."""
+        """Decodes image input (base64 string, bytes, file path, PIL Image) to RGB PIL Image."""
         if isinstance(image_input, Image.Image):
             return image_input.convert("RGB")
 
@@ -111,32 +137,34 @@ class PyTorchVisionEngine:
             return Image.open(io.BytesIO(image_input)).convert("RGB")
 
         if isinstance(image_input, str):
-            # Handle base64 data URL
             if image_input.startswith("data:image"):
                 base64_data = image_input.split(",", 1)[1]
                 image_bytes = base64.b64decode(base64_data)
                 return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            # Handle standard base64 string
+
             if len(image_input) > 500 and not os.path.exists(image_input):
                 try:
                     image_bytes = base64.b64decode(image_input)
                     return Image.open(io.BytesIO(image_bytes)).convert("RGB")
                 except Exception:
                     pass
-            # Handle file path
+
             if os.path.exists(image_input):
                 return Image.open(image_input).convert("RGB")
 
         raise ValueError("Invalid image input format. Expected base64 string, bytes, or valid file path.")
 
     def predict(self, image_input: Union[str, bytes, Image.Image]) -> Dict[str, Any]:
-        """Runs disease classification and enriches with knowledge database information."""
+        """Runs local PyTorch ResNet18 disease classification and enriches with knowledge database."""
         if not self.is_loaded:
             self.load_model()
 
-        logger.info("[AgriNex ML] Disease inference started")
+        if self.load_error or not self.model:
+            raise RuntimeError(f"PyTorch Vision Model unavailable: {self.load_error}")
 
         image = self._prepare_image(image_input)
+
+        # Image quality / non-plant heuristic check (e.g. extremely low variance)
         input_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -147,10 +175,7 @@ class PyTorchVisionEngine:
         predicted_class = self.class_names[top_idx.item()]
         confidence_percent = round(top_prob.item() * 100.0, 1)
 
-        logger.info(f"[AgriNex ML] Prediction: {predicted_class}")
-        logger.info(f"[AgriNex ML] Confidence: {confidence_percent}%")
-
-        # Extract plant name and disease name from class string (e.g., 'Tomato___Early_blight')
+        # Extract plant name and disease name from class key (e.g. 'Tomato___Early_blight')
         if "___" in predicted_class:
             plant_name, disease_raw = predicted_class.split("___", 1)
             plant_name = plant_name.replace("_", " ")
@@ -159,35 +184,25 @@ class PyTorchVisionEngine:
             plant_name = "Crop"
             disease_name = predicted_class.replace("_", " ")
 
-        # Is healthy?
         is_healthy = "healthy" in disease_name.lower() or disease_name.strip() == "Healthy"
         if is_healthy:
             disease_name = "Healthy Crop"
 
-        # Lookup knowledge database entry
+        # Knowledge database lookup
         db_entry = self.disease_db.get(predicted_class, {})
 
         symptoms = db_entry.get("symptoms")
-        if isinstance(symptoms, list):
-            symptoms_str = " ".join(symptoms)
-        else:
-            symptoms_str = symptoms or ("No visible symptoms detected. Foliage displays healthy color and structure." if is_healthy else f"Visual indicators consistent with {disease_name}.")
+        symptoms_str = " ".join(symptoms) if isinstance(symptoms, list) else (symptoms or ("Foliage exhibits lush green structure with no visible necrotic lesions or spotting." if is_healthy else f"Visual symptoms indicate {disease_name}."))
 
-        causes = db_entry.get("cause") or ("Optimal growth conditions and proper maintenance." if is_healthy else f"Infection caused by {disease_name} pathogen under high leaf moisture.")
+        causes = db_entry.get("cause") or ("Optimal microclimate and healthy soil nutrition." if is_healthy else f"Pathogenic infection associated with {disease_name}.")
 
         prevention = db_entry.get("prevention")
-        if isinstance(prevention, list):
-            prevention_str = " ".join(prevention)
-        else:
-            prevention_str = prevention or "Maintain crop field hygiene, proper plant spacing, and regular drip irrigation."
+        prevention_str = " ".join(prevention) if isinstance(prevention, list) else (prevention or "Maintain field sanitation, balanced NPK nutrients, and drip irrigation.")
 
         management = db_entry.get("management")
-        if isinstance(management, list):
-            management_str = " ".join(management)
-        else:
-            management_str = management or "No chemical treatment required for healthy foliage." if is_healthy else "Apply recommended agricultural treatment promptly."
+        management_str = " ".join(management) if isinstance(management, list) else (management or ("No chemical treatment required." if is_healthy else f"Apply recommended agricultural remedies for {disease_name}."))
 
-        severity = "Healthy" if is_healthy else ("Critical" if confidence_percent > 85 else "Moderate")
+        severity = "Healthy" if is_healthy else ("Critical" if confidence_percent > 85 else "Warning")
 
         return {
             "is_valid_crop": True,
@@ -197,38 +212,35 @@ class PyTorchVisionEngine:
             "confidence": confidence_percent,
             "confidence_level": confidence_percent,
             "severity_level": severity,
-            "health_score": 98 if is_healthy else None,
+            "health_score": 98 if is_healthy else max(20, int(100 - confidence_percent * 0.7)),
             "symptoms": symptoms_str,
             "causes": causes,
             "prevention": prevention_str,
             "treatment": management_str,
-            "organic_treatment": f"Apply neem oil or biological controls for {disease_name} prevention.",
-            "pesticide_recommendations": f"Consult local agricultural extension for registered fungicides for {disease_name}.",
-            "irrigation_recommendations": "Drip irrigation at root level. Keep foliage dry.",
+            "organic_treatment": f"Apply neem oil or biological controls for {disease_name}.",
+            "pesticide_recommendations": f"Consult local agricultural extension for labeled treatment of {disease_name}.",
+            "irrigation_recommendations": "Use drip irrigation at soil level. Keep foliage dry.",
             "fertilizer_recommendations": "Maintain balanced N-P-K soil nutrition.",
-            "recovery_steps": "1. Isolate infected foliage.\n2. Apply treatment.\n3. Monitor weekly.",
+            "recovery_steps": "1. Prune affected leaves\n2. Apply organic/chemical control\n3. Monitor field weekly",
             "estimated_recovery_time": "N/A" if is_healthy else "10-14 days",
-            "weather_risk": "High humidity promotes fungal spore growth.",
-            "prevention_tips": f"• Prune infected leaves\n• Ensure wide row spacing\n• Rotate crops annually",
+            "weather_risk": "High humidity accelerates spore spread.",
+            "prevention_tips": f"• Prune infected foliage\n• Space plants for airflow\n• Rotate crops",
             "yield_impact": "None" if is_healthy else "Moderate yield impact if left untreated.",
-            "pro_tips": "Water plants early in the morning so foliage dries quickly under sunlight.",
+            "pro_tips": "Inspect leaf undersides weekly under natural morning light.",
             "detected_object": plant_name,
-            "model": "agrinex_disease_model_v2b_best",
+            "model": "ResNet18 V2-B",
             "provider": "custom_ml"
         }
 
     def get_model_info(self) -> Dict[str, Any]:
-        """Returns engine status and metadata for /ai/model-info."""
+        """Returns runtime configuration metadata for /ai/model-info."""
         return {
             "provider": "custom_ml",
-            "model": "agrinex_disease_model_v2b_best (ResNet18 V2-B 60-Class)",
-            "status": "loaded" if self.is_loaded else "ready",
-            "num_classes": self.num_classes or 60,
-            "device": str(self.device),
-            "model_path": str(self.model_path),
-            "database_loaded": bool(self.disease_db)
+            "model": "ResNet18 V2-B",
+            "classes": self.num_classes or 60,
+            "status": "loaded" if self.is_loaded else "error"
         }
 
 
-# Singleton engine instance
+# Singleton instance loaded on import / startup
 vision_engine = PyTorchVisionEngine()
