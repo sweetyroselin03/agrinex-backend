@@ -1,12 +1,17 @@
 """
 AgriNex Local PyTorch ML Vision Engine (V2-B ResNet18 Model - 60 Classes)
 
-Safe, non-blocking lazy-loading inference engine for AgriNex trained ML disease classification model.
-Supports automatic Git LFS model downloading if deploying in environments without pre-extracted LFS assets.
+Ultra-low-memory, lazy-loading inference engine optimized for Render 512MB RAM instances.
+Memory optimizations:
+- Instant server startup (0 MB ML RAM overhead)
+- On-demand lazy model loading on first scan request
+- Immediate Garbage Collection & memory deletion of raw checkpoints
+- Single-threaded CPU execution (torch.set_num_threads(1))
 """
 
 import os
 import io
+import gc
 import json
 import base64
 import logging
@@ -22,6 +27,7 @@ try:
     from torchvision import transforms, models
     from PIL import Image, ImageFile
     ImageFile.LOAD_TRUNCATED_IMAGES = True
+    torch.set_num_threads(1)
     TORCH_AVAILABLE = True
     TORCH_IMPORT_ERROR = None
 except Exception as torch_err:
@@ -58,7 +64,7 @@ class PyTorchVisionEngine:
         self.device = torch.device("cpu") if TORCH_AVAILABLE else "cpu"
         self.model = None
         self.class_names = []
-        self.num_classes = 0
+        self.num_classes = 60
         self.disease_db = {}
         self.is_loaded = False
         self.load_error = None
@@ -70,7 +76,7 @@ class PyTorchVisionEngine:
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
 
         if not self.model_path.exists():
-            logger.warning(f"[AgriNex ML] Model file missing at {self.model_path}. Attempting LFS download...")
+            logger.warning(f"[AgriNex ML] Model file missing at {self.model_path}. Downloading from LFS...")
             self._download_lfs_model()
             return
 
@@ -79,7 +85,7 @@ class PyTorchVisionEngine:
 
         # If file size is less than 10MB, it's an LFS pointer file (~130 bytes)
         if file_size < 10_000_000:
-            logger.warning(f"[AgriNex ML Warning] File at {self.model_path} is a Git LFS pointer file ({file_size} bytes). Downloading binary weights...")
+            logger.warning(f"[AgriNex ML Warning] File at {self.model_path} is an LFS pointer file ({file_size} bytes). Downloading binary weights...")
             self._download_lfs_model()
 
     def _download_lfs_model(self):
@@ -102,7 +108,7 @@ class PyTorchVisionEngine:
             raise e
 
     def load_model(self):
-        """Safely loads and validates the trained ResNet18 V2-B model in CPU memory."""
+        """Safely loads and validates the trained ResNet18 V2-B model with minimal RAM footprint."""
         if not TORCH_AVAILABLE:
             self.load_error = f"PyTorch dependencies not installed: {TORCH_IMPORT_ERROR}"
             logger.error(f"[AgriNex ML Error] {self.load_error}")
@@ -124,10 +130,15 @@ class PyTorchVisionEngine:
 
             logger.info("[AgriNex ML] Loading ResNet18 V2-B...")
 
-            # 2. Load checkpoint into CPU memory
-            checkpoint = torch.load(self.model_path, map_location=self.device)
+            # 2. Load checkpoint into CPU memory with strict garbage collection to stay within 512MB RAM
+            checkpoint = torch.load(self.model_path, map_location="cpu")
             self.class_names = checkpoint.get("class_names", [])
             self.num_classes = checkpoint.get("num_classes", len(self.class_names))
+            state_dict = checkpoint.get("model_state_dict")
+
+            # Free checkpoint wrapper dictionary immediately
+            del checkpoint
+            gc.collect()
 
             # 3. Class count validation
             if not self.class_names or self.num_classes != 60:
@@ -141,7 +152,12 @@ class PyTorchVisionEngine:
             self.model = models.resnet18(weights=None)
             in_features = self.model.fc.in_features
             self.model.fc = nn.Linear(in_features, self.num_classes)
-            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self.model.load_state_dict(state_dict)
+
+            # Free state_dict memory immediately
+            del state_dict
+            gc.collect()
+
             self.model.to(self.device)
             self.model.eval()
 
@@ -150,10 +166,12 @@ class PyTorchVisionEngine:
                 with open(self.db_path, "r", encoding="utf-8") as f:
                     self.disease_db = json.load(f)
 
-            # 6. Run dummy tensor inference test
-            dummy_input = torch.randn(1, 3, 224, 224).to(self.device)
-            with torch.no_grad():
+            # 6. Run dummy tensor inference test under inference_mode
+            with torch.inference_mode():
+                dummy_input = torch.randn(1, 3, 224, 224).to(self.device)
                 _ = self.model(dummy_input)
+                del dummy_input
+                gc.collect()
 
             self.is_loaded = True
             self.load_error = None
@@ -210,13 +228,16 @@ class PyTorchVisionEngine:
         image = self._prepare_image(image_input)
         input_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = self.model(input_tensor)
             probabilities = torch.softmax(logits, dim=1).squeeze(0)
 
         top_prob, top_idx = torch.max(probabilities, dim=0)
         predicted_class = self.class_names[top_idx.item()]
         confidence_percent = round(top_prob.item() * 100.0, 1)
+
+        del input_tensor, logits, probabilities
+        gc.collect()
 
         # Extract plant name and disease name
         if "___" in predicted_class:
