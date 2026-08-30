@@ -1,9 +1,8 @@
 """
 AgriNex Local PyTorch ML Vision Engine (V2-B ResNet18 Model - 60 Classes)
 
-Loads the trained ResNet18 V2-B checkpoint (agrinex_disease_model_v2b_best.pth),
-runs CPU inference matching exact training preprocessing pipelines,
-and enriches predictions with curated disease knowledge database (disease_info.json).
+Safe, lazy-loading inference engine for AgriNex trained ML disease classification model.
+Supports automatic Git LFS model downloading if deploying in environments without pre-extracted LFS assets.
 """
 
 import os
@@ -11,6 +10,8 @@ import io
 import json
 import base64
 import logging
+import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Dict, Any, Union
 
@@ -29,6 +30,8 @@ DEFAULT_MODEL_PATH = os.getenv(
     str(BASE_DIR / "ai_model_training" / "agrinex_disease_model_v2b_best.pth")
 )
 DEFAULT_DB_PATH = str(BASE_DIR / "ai_model_training" / "disease_info.json")
+
+LFS_DOWNLOAD_URL = "https://media.githubusercontent.com/media/sweetyroselin03/agrinex-backend/main/ai_model_training/agrinex_disease_model_v2b_best.pth"
 
 
 def get_inference_transforms(image_size: int = 224) -> transforms.Compose:
@@ -53,48 +56,78 @@ class PyTorchVisionEngine:
         self.disease_db = {}
         self.is_loaded = False
         self.load_error = None
+        self.is_loading = False
         self.transform = get_inference_transforms(224)
 
+    def _ensure_real_model_file(self):
+        """Validates model file existence and resolves Git LFS pointer files automatically."""
+        self.model_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check if file exists
+        if not self.model_path.exists():
+            logger.warning(f"[AgriNex ML] Model file missing at {self.model_path}. Attempting LFS download...")
+            self._download_lfs_model()
+            return
+
+        file_size = os.path.getsize(self.model_path)
+        logger.info(f"[AgriNex ML] Model file size: {file_size} bytes")
+
+        # If file size is less than 10MB, it's an LFS pointer file (~130 bytes)
+        if file_size < 10_000_000:
+            logger.warning(f"[AgriNex ML Warning] File at {self.model_path} is a Git LFS pointer file ({file_size} bytes). Downloading binary weights...")
+            self._download_lfs_model()
+
+    def _download_lfs_model(self):
+        """Downloads real PyTorch binary model weights from GitHub LFS storage."""
+        try:
+            logger.info(f"[AgriNex ML] Downloading ResNet18 weights from {LFS_DOWNLOAD_URL}...")
+            req = urllib.request.Request(
+                LFS_DOWNLOAD_URL,
+                headers={"User-Agent": "Mozilla/5.0 (AgriNex Backend Auto-Downloader)"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = resp.read()
+                with open(self.model_path, "wb") as f:
+                    f.write(data)
+
+            downloaded_size = os.path.getsize(self.model_path)
+            logger.info(f"[AgriNex ML] Download complete! Model size: {downloaded_size} bytes")
+        except Exception as e:
+            logger.error(f"[AgriNex ML Error] Failed to download model weights from GitHub LFS: {e}")
+            raise e
+
     def load_model(self):
-        """Loads and validates the trained ResNet18 V2-B model in CPU memory."""
+        """Safely loads and validates the trained ResNet18 V2-B model in CPU memory."""
         if self.is_loaded:
             return
 
-        logger.info("[AgriNex ML] Loading ResNet18 V2-B...")
+        if self.is_loading:
+            return
+
+        self.is_loading = True
+        logger.info("[AgriNex ML] Initializing...")
+        logger.info(f"[AgriNex ML] Model path: {self.model_path}")
 
         try:
-            # 1. Model file existence check
-            if not self.model_path.exists():
-                alt_path = BASE_DIR.parent / "AGRINEX-DISEASE-ML" / "models" / "agrinex_disease_model_v2b_best.pth"
-                if alt_path.exists():
-                    self.model_path = alt_path
-                else:
-                    err_msg = f"[AgriNex ML Error] Model checkpoint missing at: {self.model_path}"
-                    logger.error(err_msg)
-                    self.load_error = err_msg
-                    raise FileNotFoundError(err_msg)
+            # 1. Ensure real binary model checkpoint exists
+            self._ensure_real_model_file()
 
-            # 2. Check model file size (must be real weights, not LFS pointer file)
-            file_size = os.path.getsize(self.model_path)
-            if file_size < 10_000_000:
-                err_msg = f"[AgriNex ML Error] Model file at {self.model_path} is an LFS pointer or corrupted (size: {file_size} bytes)."
-                logger.error(err_msg)
-                self.load_error = err_msg
-                raise ValueError(err_msg)
+            logger.info("[AgriNex ML] Loading ResNet18 V2-B...")
 
-            # 3. Load checkpoint
+            # 2. Load checkpoint into CPU memory
             checkpoint = torch.load(self.model_path, map_location=self.device)
             self.class_names = checkpoint.get("class_names", [])
             self.num_classes = checkpoint.get("num_classes", len(self.class_names))
 
-            # 4. Class count validation
+            # 3. Class count validation
             if not self.class_names or self.num_classes != 60:
-                err_msg = f"[AgriNex ML Error] Checkpoint must contain exactly 60 classes. Found: {self.num_classes}"
+                err_msg = f"[AgriNex ML Error] Checkpoint must contain 60 classes. Found: {self.num_classes}"
                 logger.error(err_msg)
                 self.load_error = err_msg
+                self.is_loading = False
                 raise ValueError(err_msg)
 
-            # 5. Reconstruct ResNet18 architecture & load state_dict
+            # 4. Reconstruct ResNet18 architecture & load state_dict
             self.model = models.resnet18(weights=None)
             in_features = self.model.fc.in_features
             self.model.fc = nn.Linear(in_features, self.num_classes)
@@ -102,30 +135,30 @@ class PyTorchVisionEngine:
             self.model.to(self.device)
             self.model.eval()
 
-            # 6. Disease knowledge database validation
-            if not self.db_path.exists():
-                logger.warning(f"[AgriNex ML Warning] Disease info database missing at {self.db_path}")
-            else:
+            # 5. Disease knowledge database loading
+            if self.db_path.exists():
                 with open(self.db_path, "r", encoding="utf-8") as f:
                     self.disease_db = json.load(f)
 
-            # 7. Test dummy tensor inference
+            # 6. Run dummy tensor inference test
             dummy_input = torch.randn(1, 3, 224, 224).to(self.device)
             with torch.no_grad():
                 _ = self.model(dummy_input)
 
             self.is_loaded = True
             self.load_error = None
+            self.is_loading = False
 
-            # EXACT REQUIRED STARTUP LOGS
+            # REQUIRED STARTUP LOGS
             logger.info("[AgriNex ML] Model loaded successfully")
             logger.info(f"[AgriNex ML] Classes: {self.num_classes}")
             logger.info(f"[AgriNex ML] Device: {self.device.type}")
 
         except Exception as e:
             self.is_loaded = False
+            self.is_loading = False
             self.load_error = str(e)
-            logger.error(f"[AgriNex ML Fatal Error] Failed to initialize PyTorch ML vision engine: {e}")
+            logger.error(f"[AgriNex ML Error] Failed to load PyTorch model: {e}")
             raise e
 
     def _prepare_image(self, image_input: Union[str, bytes, Image.Image]) -> Image.Image:
@@ -163,8 +196,6 @@ class PyTorchVisionEngine:
             raise RuntimeError(f"PyTorch Vision Model unavailable: {self.load_error}")
 
         image = self._prepare_image(image_input)
-
-        # Image quality / non-plant heuristic check (e.g. extremely low variance)
         input_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
@@ -175,7 +206,7 @@ class PyTorchVisionEngine:
         predicted_class = self.class_names[top_idx.item()]
         confidence_percent = round(top_prob.item() * 100.0, 1)
 
-        # Extract plant name and disease name from class key (e.g. 'Tomato___Early_blight')
+        # Extract plant name and disease name
         if "___" in predicted_class:
             plant_name, disease_raw = predicted_class.split("___", 1)
             plant_name = plant_name.replace("_", " ")
@@ -192,7 +223,7 @@ class PyTorchVisionEngine:
         db_entry = self.disease_db.get(predicted_class, {})
 
         symptoms = db_entry.get("symptoms")
-        symptoms_str = " ".join(symptoms) if isinstance(symptoms, list) else (symptoms or ("Foliage exhibits lush green structure with no visible necrotic lesions or spotting." if is_healthy else f"Visual symptoms indicate {disease_name}."))
+        symptoms_str = " ".join(symptoms) if isinstance(symptoms, list) else (symptoms or ("Foliage exhibits lush green structure with no visible necrotic lesions." if is_healthy else f"Visual symptoms indicate {disease_name}."))
 
         causes = db_entry.get("cause") or ("Optimal microclimate and healthy soil nutrition." if is_healthy else f"Pathogenic infection associated with {disease_name}.")
 
@@ -224,7 +255,7 @@ class PyTorchVisionEngine:
             "recovery_steps": "1. Prune affected leaves\n2. Apply organic/chemical control\n3. Monitor field weekly",
             "estimated_recovery_time": "N/A" if is_healthy else "10-14 days",
             "weather_risk": "High humidity accelerates spore spread.",
-            "prevention_tips": f"• Prune infected foliage\n• Space plants for airflow\n• Rotate crops",
+            "prevention_tips": "• Prune infected foliage\n• Space plants for airflow\n• Rotate crops",
             "yield_impact": "None" if is_healthy else "Moderate yield impact if left untreated.",
             "pro_tips": "Inspect leaf undersides weekly under natural morning light.",
             "detected_object": plant_name,
@@ -238,9 +269,9 @@ class PyTorchVisionEngine:
             "provider": "custom_ml",
             "model": "ResNet18 V2-B",
             "classes": self.num_classes or 60,
-            "status": "loaded" if self.is_loaded else "error"
+            "status": "loaded" if self.is_loaded else ("error" if self.load_error else "unloaded")
         }
 
 
-# Singleton instance loaded on import / startup
+# Singleton instance
 vision_engine = PyTorchVisionEngine()

@@ -68,6 +68,13 @@ app.include_router(auth_router.router)
 logger = logging.getLogger("uvicorn.error")
 logger.info("[Startup] Application ready. Brevo Transactional Email API will be used on-demand during OTP requests.")
 
+@app.on_event("startup")
+async def startup_event():
+    logger.info("[Startup] AgriNex AI Enterprise Backend starting...")
+    import asyncio
+    from .pytorch_vision_engine import vision_engine
+    asyncio.create_task(asyncio.to_thread(vision_engine.load_model))
+
 @app.middleware("http")
 async def log_requests(request, call_next):
     logger.info(f"Incoming request: {request.method} {request.url.path}")
