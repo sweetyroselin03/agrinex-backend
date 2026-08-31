@@ -1,14 +1,8 @@
 import os
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from dotenv import load_dotenv
 
 load_dotenv()
-
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./agrinex.db")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-engine = create_engine(DATABASE_URL)
 
 def add_column_if_missing(conn, table: str, column: str, col_type: str):
     try:
@@ -24,16 +18,37 @@ def add_column_if_missing(conn, table: str, column: str, col_type: str):
             conn.rollback()
             print(f"INFO: Could not add column '{column}' to '{table}': {e}")
 
-def sync_db():
+def sync_db(bind_engine=None):
+    if bind_engine is None:
+        from app.database import engine as default_engine
+        bind_engine = default_engine
+
     print("Syncing Database Schema...")
     
-    with engine.connect() as conn:
+    with bind_engine.connect() as conn:
+        # Users table column sync
+        add_column_if_missing(conn, "users", "phone", "VARCHAR")
+        add_column_if_missing(conn, "users", "full_name", "VARCHAR")
         add_column_if_missing(conn, "users", "username", "VARCHAR")
+        add_column_if_missing(conn, "users", "hashed_password", "VARCHAR")
+        add_column_if_missing(conn, "users", "village", "VARCHAR")
+        add_column_if_missing(conn, "users", "district", "VARCHAR")
+        add_column_if_missing(conn, "users", "state", "VARCHAR")
+        add_column_if_missing(conn, "users", "farm_size", "VARCHAR")
         add_column_if_missing(conn, "users", "experience", "VARCHAR")
         add_column_if_missing(conn, "users", "crop_specialization", "VARCHAR")
+        add_column_if_missing(conn, "users", "crop_types", "VARCHAR")
+        add_column_if_missing(conn, "users", "profile_picture", "VARCHAR")
+        add_column_if_missing(conn, "users", "bio", "VARCHAR")
         add_column_if_missing(conn, "users", "website", "VARCHAR")
+        add_column_if_missing(conn, "users", "is_verified", "BOOLEAN DEFAULT TRUE")
+        
+        # Other tables column sync
         add_column_if_missing(conn, "chat_messages", "conversation_id", "VARCHAR")
         add_column_if_missing(conn, "posts", "images", "TEXT")
+        add_column_if_missing(conn, "posts", "hashtags", "VARCHAR")
+        add_column_if_missing(conn, "posts", "location", "VARCHAR")
+        add_column_if_missing(conn, "posts", "crop_category", "VARCHAR")
 
         try:
             print("Cleaning duplicate follows before enforcing unique constraint...")
@@ -62,8 +77,9 @@ def sync_db():
 
     # Ensure all tables created via metadata
     from app.models import Base
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=bind_engine)
     print("\nDatabase sync completed successfully!")
 
 if __name__ == "__main__":
     sync_db()
+

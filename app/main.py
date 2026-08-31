@@ -22,7 +22,7 @@ def _init_db_schema():
     try:
         models.Base.metadata.create_all(bind=engine)
         import sync_db
-        sync_db.sync_db()
+        sync_db.sync_db(bind_engine=engine)
         logging.getLogger("uvicorn.error").info("[Startup] Database tables synchronized.")
     except Exception as sync_err:
         logging.getLogger("uvicorn.error").warning(f"[Startup DB Sync Warning] {sync_err}")
