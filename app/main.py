@@ -16,16 +16,20 @@ from jose import JWTError, jwt
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
-# Create tables and sync schema
-models.Base.metadata.create_all(bind=engine)
-try:
-    import sync_db
-    sync_db.sync_db()
-except Exception as sync_err:
-    logging.getLogger("uvicorn.error").warning(f"[Startup DB Sync Warning] {sync_err}")
+# Create tables and sync schema non-blockingly
+def _init_db_schema():
+    try:
+        models.Base.metadata.create_all(bind=engine)
+        import sync_db
+        sync_db.sync_db()
+        logging.getLogger("uvicorn.error").info("[Startup] Database tables synchronized.")
+    except Exception as sync_err:
+        logging.getLogger("uvicorn.error").warning(f"[Startup DB Sync Warning] {sync_err}")
+
+import threading
+threading.Thread(target=_init_db_schema, daemon=True).start()
 
 logger_startup = logging.getLogger("uvicorn.error")
-logger_startup.info("[Startup] Database tables synchronized via SQLAlchemy ORM.")
 
 ENV = os.getenv("ENV", "production")
 show_docs = os.getenv("SHOW_DOCS", "false").lower() in ("true", "1", "yes") or ENV == "development"
