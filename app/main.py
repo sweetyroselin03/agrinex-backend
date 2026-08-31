@@ -2149,15 +2149,10 @@ async def websocket_chat_endpoint(websocket: WebSocket, user_id: int, db: Sessio
 def get_ai_model_info():
     """Returns runtime status and provider configuration of AgriNex AI services."""
     llama_model = os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile")
-    scanner_status = "loaded" if vision_engine.is_loaded else ("error" if vision_engine.load_error else "unloaded")
+    scanner_info = vision_engine.get_model_info()
 
     return {
-        "disease_scanner": {
-            "provider": "custom_ml",
-            "model": "ResNet18 V2-B",
-            "classes": 60,
-            "status": scanner_status
-        },
+        "disease_scanner": scanner_info,
         "ai_chat": {
             "provider": "groq",
             "model": llama_model,
