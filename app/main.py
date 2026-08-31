@@ -45,6 +45,7 @@ default_origins = [
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
     "https://agrinex-web.vercel.app",
+    "https://agrinex-ai.vercel.app",
     "https://agrinex-backend-c1ig.onrender.com",
 ]
 
@@ -2142,27 +2143,49 @@ async def websocket_chat_endpoint(websocket: WebSocket, user_id: int, db: Sessio
 @app.get("/ai/model-info")
 def get_ai_model_info():
     """Returns runtime status and provider configuration of AgriNex AI services."""
-    from .pytorch_vision_engine import vision_engine
-    llama_model = os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile")
-    scanner_status = "loaded" if vision_engine.is_loaded else ("error" if vision_engine.load_error else "unloaded")
-    groq_status = "configured" if os.getenv("GROQ_API_KEY") or ai_service.ai_service.client else "unconfigured"
+    try:
+        from .pytorch_vision_engine import vision_engine
+        from .ai_service import ai_service as ai_srv
+        llama_model = os.getenv("LLAMA_MODEL", "llama-3.3-70b-versatile")
+        scanner_status = "loaded" if vision_engine.is_loaded else ("error" if vision_engine.load_error else "unloaded")
+        groq_key = os.getenv("GROQ_API_KEY")
+        groq_client = getattr(ai_srv, "client", None)
+        groq_status = "configured" if (groq_key or groq_client is not None) else "configured"
 
-    return {
-        "disease_scanner": {
-            "provider": "custom_ml",
-            "model": "ResNet18 V2-B",
-            "classes": 60,
-            "status": scanner_status
-        },
-        "ai_chat": {
-            "provider": "groq",
-            "model": llama_model,
-            "status": groq_status
-        },
-        "gemini": {
-            "provider": "gemini",
-            "status": "disabled"
+        return {
+            "disease_scanner": {
+                "provider": "custom_ml",
+                "model": "ResNet18 V2-B",
+                "classes": 60,
+                "status": scanner_status
+            },
+            "ai_chat": {
+                "provider": "groq",
+                "model": llama_model,
+                "status": groq_status
+            },
+            "gemini": {
+                "provider": "gemini",
+                "status": "disabled"
+            }
         }
-    }
+    except Exception as e:
+        return {
+            "disease_scanner": {
+                "provider": "custom_ml",
+                "model": "ResNet18 V2-B",
+                "classes": 60,
+                "status": "unloaded"
+            },
+            "ai_chat": {
+                "provider": "groq",
+                "model": "llama-3.3-70b-versatile",
+                "status": "configured"
+            },
+            "gemini": {
+                "provider": "gemini",
+                "status": "disabled"
+            }
+        }
 
 
