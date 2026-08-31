@@ -17,7 +17,7 @@ from jose import JWTError, jwt
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login", auto_error=False)
 
-# Create tables and sync schema non-blockingly
+# Create tables and sync schema synchronously on startup
 def _init_db_schema():
     try:
         models.Base.metadata.create_all(bind=engine)
@@ -27,8 +27,7 @@ def _init_db_schema():
     except Exception as sync_err:
         logging.getLogger("uvicorn.error").warning(f"[Startup DB Sync Warning] {sync_err}")
 
-import threading
-threading.Thread(target=_init_db_schema, daemon=True).start()
+_init_db_schema()
 
 logger_startup = logging.getLogger("uvicorn.error")
 

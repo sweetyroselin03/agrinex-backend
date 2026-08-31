@@ -42,6 +42,7 @@ def sync_db(bind_engine=None):
         add_column_if_missing(conn, "users", "bio", "VARCHAR")
         add_column_if_missing(conn, "users", "website", "VARCHAR")
         add_column_if_missing(conn, "users", "is_verified", "BOOLEAN DEFAULT TRUE")
+        add_column_if_missing(conn, "users", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
         
         # Other tables column sync
         add_column_if_missing(conn, "chat_messages", "conversation_id", "VARCHAR")
