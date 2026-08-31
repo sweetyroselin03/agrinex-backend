@@ -41,7 +41,7 @@ DEFAULT_MODEL_PATH = os.getenv(
 )
 DEFAULT_DB_PATH = str(BASE_DIR / "ai_model_training" / "disease_info.json")
 
-LFS_DOWNLOAD_URL = "https://media.githubusercontent.com/media/sweetyroselin03/agrinex-backend/main/ai_model_training/agrinex_disease_model_v2b_best.pth"
+LFS_DOWNLOAD_URL = "https://media.githubusercontent.com/media/sweetyroselin03/agrinex/main/backend/ai_model_training/agrinex_disease_model_v2b_best.pth"
 
 
 def get_inference_transforms(image_size: int = 224):
